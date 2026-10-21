@@ -165,11 +165,22 @@ export const SUPPORTED_FILE_TYPES: SupportedFileType[] = [
 ];
 
 /**
- * Get file type info from filename
+ * Get file type info from filename or MIME type
  */
-export function getFileTypeInfo(fileName: string): SupportedFileType | null {
-    const ext = fileName.toLowerCase().substring(fileName.lastIndexOf('.'));
-    return SUPPORTED_FILE_TYPES.find(ft => ft.extension === ext) || null;
+export function getFileTypeInfo(fileName: string, mimeType?: string): SupportedFileType | null {
+    const dotIndex = fileName.lastIndexOf('.');
+    if (dotIndex !== -1) {
+        const ext = fileName.toLowerCase().substring(dotIndex);
+        const byExt = SUPPORTED_FILE_TYPES.find(ft => ft.extension === ext);
+        if (byExt) {
+            return byExt;
+        }
+    }
+    if (mimeType) {
+        const normalizedMime = mimeType.toLowerCase().split(';')[0].trim();
+        return SUPPORTED_FILE_TYPES.find(ft => ft.mimeType === normalizedMime) || null;
+    }
+    return null;
 }
 
 /**
@@ -198,21 +209,27 @@ export function getSizeById(category: ContentCategory, sizeId: string): SizeOpti
 /**
  * Check if file is supported
  */
-export function isFileSupported(fileName: string): boolean {
-    return getFileTypeInfo(fileName) !== null;
+export function isFileSupported(fileName: string, mimeType?: string): boolean {
+    return getFileTypeInfo(fileName, mimeType) !== null;
 }
 
 /**
  * Get supported extensions as string for file input
  */
 export function getSupportedExtensions(): string {
-    return SUPPORTED_FILE_TYPES.map(ft => ft.extension).join(',');
+    return SUPPORTED_EXTENSIONS.join(',');
 }
 
 /**
- * Supported extensions array for file input accept attribute
+ * Supported extensions and MIME types array for file input accept attribute (includes MIME wildcards for Android picker)
  */
-export const SUPPORTED_EXTENSIONS: string[] = SUPPORTED_FILE_TYPES.map(ft => ft.extension);
+export const SUPPORTED_EXTENSIONS: string[] = [
+    ...SUPPORTED_FILE_TYPES.map(ft => ft.extension),
+    'image/*',
+    'video/*',
+    'audio/*',
+    'application/pdf'
+];
 
 /**
  * Get category icon

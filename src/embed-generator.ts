@@ -7,6 +7,14 @@ import { ContentCategory, SizeOption, DriveUploadResult, EmbedOptions } from './
 import { getFileTypeInfo } from './size-presets';
 
 export class EmbedGenerator {
+    private escapeHtmlAttr(value: string): string {
+        return value
+            .replace(/&/g, '&amp;')
+            .replace(/"/g, '&quot;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;');
+    }
+
     /**
      * Generate embed code for a file uploaded to Google Drive
      */
@@ -15,20 +23,23 @@ export class EmbedGenerator {
         uploadResult: DriveUploadResult,
         options: EmbedOptions
     ): string {
-        const fileInfo = getFileTypeInfo(fileName);
+        const fileInfo = getFileTypeInfo(fileName, uploadResult.mimeType);
         const { size, showTitle } = options;
+        const safeMarkdownName = fileName.replace(/[[\]]/g, '\\$&');
+        const viewUrl = uploadResult.webViewLink || `https://drive.google.com/file/d/${uploadResult.fileId}/view`;
 
         let embedCode = '';
 
-        // Add title if enabled
+        // Always include a clickable Markdown link to the Google Drive file
         if (showTitle) {
-            embedCode += `**📁 ${fileName}**\n\n`;
+            embedCode += `**[📁 ${safeMarkdownName}](${viewUrl})**\n\n`;
+        } else {
+            embedCode += `[📁 ${safeMarkdownName}](${viewUrl})\n\n`;
         }
 
         // Generate embed based on category
         if (!fileInfo) {
-            embedCode += this.generateGenericEmbed(uploadResult);
-            return embedCode;
+            return embedCode.trimEnd();
         }
 
         switch (fileInfo.category) {
@@ -42,10 +53,10 @@ export class EmbedGenerator {
                 embedCode += this.generateDocumentEmbed(uploadResult, size);
                 break;
             case 'image':
-                embedCode += this.generateImageEmbed(uploadResult, size, fileName);
+                embedCode += this.generateImageEmbed(uploadResult, size, this.escapeHtmlAttr(fileName));
                 break;
             default:
-                embedCode += this.generateGenericEmbed(uploadResult);
+                break;
         }
 
         return embedCode;

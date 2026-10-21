@@ -16,6 +16,7 @@ export default class DriveEmbedderPlugin extends Plugin {
     private oauthFlow: GoogleOAuthFlow | null = null;
     private uploader: GoogleDriveUploader | null = null;
     private embedGenerator: EmbedGenerator;
+    private domObserver: MutationObserver | null = null;
 
     async onload() {
         await this.loadSettings();
@@ -27,7 +28,7 @@ export default class DriveEmbedderPlugin extends Plugin {
 
         // Add ribbon icon
         this.addRibbonIcon('cloud-upload', 'Drive Embedder: upload file', () => {
-            this.openUploadModal();
+            this.openUploadModal(this.getActiveMarkdownEditor());
         });
 
         // Add command
@@ -42,10 +43,17 @@ export default class DriveEmbedderPlugin extends Plugin {
         // Add settings tab
         this.addSettingTab(new DriveEmbedderSettingTab(this.app, this));
 
+        // Hydrate private Google Drive embeds in Reading View and Live Preview
+        this.setupPrivateEmbedHydration();
+
         console.debug('Drive Embedder loaded');
     }
 
     onunload() {
+        this.oauthFlow?.cancel();
+        this.domObserver?.disconnect();
+        this.domObserver = null;
+        this.uploader?.revokeAllBlobUrls();
         console.debug('Drive Embedder unloaded');
     }
 
@@ -59,17 +67,21 @@ export default class DriveEmbedderPlugin extends Plugin {
     }
 
     private initializeServices() {
-        if (this.settings.googleClientId && this.settings.googleClientSecret) {
+        this.oauthFlow?.cancel();
+        const clientId = this.settings.googleClientId.trim();
+        const clientSecret = this.settings.googleClientSecret.trim();
+
+        if (clientId && clientSecret) {
             this.oauthFlow = new GoogleOAuthFlow({
-                clientId: this.settings.googleClientId,
-                clientSecret: this.settings.googleClientSecret,
+                clientId,
+                clientSecret,
                 redirectPort: 8586
             });
 
             if (this.settings.googleAccessToken) {
                 this.uploader = new GoogleDriveUploader({
-                    clientId: this.settings.googleClientId,
-                    clientSecret: this.settings.googleClientSecret,
+                    clientId,
+                    clientSecret,
                     accessToken: this.settings.googleAccessToken,
                     refreshToken: this.settings.googleRefreshToken,
                     tokenExpiresAt: this.settings.tokenExpiresAt,
@@ -80,7 +92,132 @@ export default class DriveEmbedderPlugin extends Plugin {
                         await this.saveSettings();
                     }
                 });
+                this.hydrateDriveEmbeds(document.body);
             }
+        }
+    }
+
+    private setupPrivateEmbedHydration() {
+        this.registerMarkdownPostProcessor((el) => {
+            this.hydrateDriveEmbeds(el);
+        });
+
+        this.app.workspace.onLayoutReady(() => {
+            this.hydrateDriveEmbeds(document.body);
+        });
+
+        this.registerEvent(
+            this.app.workspace.on('layout-change', () => {
+                this.hydrateDriveEmbeds(document.body);
+            })
+        );
+
+        this.registerEvent(
+            this.app.workspace.on('active-leaf-change', () => {
+                this.hydrateDriveEmbeds(document.body);
+            })
+        );
+
+        this.domObserver = new MutationObserver((mutations) => {
+            for (const mutation of mutations) {
+                for (let i = 0; i < mutation.addedNodes.length; i++) {
+                    const node = mutation.addedNodes[i];
+                    if (node instanceof HTMLElement) {
+                        this.hydrateDriveEmbeds(node);
+                    }
+                }
+            }
+        });
+
+        this.domObserver.observe(document.body, {
+            childList: true,
+            subtree: true
+        });
+    }
+
+    private extractDriveFileId(rawUrl: string): string | null {
+        if (!rawUrl || !rawUrl.includes('drive.google.com')) {
+            return null;
+        }
+        const idQueryMatch = rawUrl.match(/[?&]id=([a-zA-Z0-9_-]+)/);
+        if (idQueryMatch && idQueryMatch[1]) {
+            return idQueryMatch[1];
+        }
+        const pathMatch = rawUrl.match(/\/file\/d\/([a-zA-Z0-9_-]+)/);
+        if (pathMatch && pathMatch[1]) {
+            return pathMatch[1];
+        }
+        return null;
+    }
+
+    private hydrateDriveEmbeds(root: ParentNode) {
+        if (!this.uploader || !this.isConnected()) {
+            return;
+        }
+
+        const images: HTMLImageElement[] = [];
+        if (root instanceof HTMLImageElement) {
+            images.push(root);
+        } else if (root.querySelectorAll) {
+            root.querySelectorAll('img').forEach((img) => images.push(img));
+        }
+
+        for (const img of images) {
+            const rawSrc = img.getAttribute('src') || '';
+            const fileId = img.dataset.driveFileId || this.extractDriveFileId(rawSrc);
+            if (!fileId || rawSrc.startsWith('blob:') || img.dataset.driveHydrating === 'true') {
+                continue;
+            }
+            img.dataset.driveFileId = fileId;
+            img.dataset.driveHydrating = 'true';
+            void this.uploader.downloadFileAsBlobUrl(fileId).then((entry) => {
+                img.dataset.driveHydrating = 'false';
+                if (entry && entry.blobUrl) {
+                    img.src = entry.blobUrl;
+                }
+            });
+        }
+
+        const iframes: HTMLIFrameElement[] = [];
+        if (root instanceof HTMLIFrameElement) {
+            iframes.push(root);
+        } else if (root.querySelectorAll) {
+            root.querySelectorAll('iframe').forEach((iframe) => iframes.push(iframe));
+        }
+
+        for (const iframe of iframes) {
+            const rawSrc = iframe.getAttribute('src') || '';
+            const fileId = iframe.dataset.driveFileId || this.extractDriveFileId(rawSrc);
+            if (!fileId || rawSrc.startsWith('blob:') || iframe.dataset.driveHydrating === 'true') {
+                continue;
+            }
+            iframe.dataset.driveFileId = fileId;
+            iframe.dataset.driveHydrating = 'true';
+            void this.uploader.downloadFileAsBlobUrl(fileId).then((entry) => {
+                iframe.dataset.driveHydrating = 'false';
+                if (!entry || !entry.blobUrl) {
+                    return;
+                }
+                if (entry.mimeType.startsWith('video/')) {
+                    const video = document.createElement('video');
+                    video.controls = true;
+                    video.src = entry.blobUrl;
+                    video.style.width = iframe.getAttribute('width') || '100%';
+                    video.style.height = iframe.getAttribute('height') || 'auto';
+                    video.style.borderRadius = '8px';
+                    video.style.boxShadow = '0 2px 8px rgba(0,0,0,0.15)';
+                    video.style.backgroundColor = '#000';
+                    iframe.replaceWith(video);
+                } else if (entry.mimeType.startsWith('audio/')) {
+                    const audio = document.createElement('audio');
+                    audio.controls = true;
+                    audio.src = entry.blobUrl;
+                    audio.style.width = '100%';
+                    iframe.replaceWith(audio);
+                } else if (entry.mimeType === 'application/pdf') {
+                    iframe.src = entry.blobUrl;
+                }
+            });
         }
     }
 
@@ -109,6 +246,7 @@ export default class DriveEmbedderPlugin extends Plugin {
     }
 
     async disconnectGoogleDrive() {
+        this.uploader?.revokeAllBlobUrls();
         this.settings.googleAccessToken = '';
         this.settings.googleRefreshToken = '';
         this.settings.tokenExpiresAt = 0;
@@ -121,6 +259,24 @@ export default class DriveEmbedderPlugin extends Plugin {
         return !!this.settings.googleAccessToken && !!this.uploader;
     }
 
+    private getActiveMarkdownEditor(preferredEditor?: Editor): Editor | undefined {
+        if (preferredEditor) {
+            return preferredEditor;
+        }
+        const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+        if (activeView?.editor) {
+            return activeView.editor;
+        }
+        if (this.app.workspace.activeEditor?.editor) {
+            return this.app.workspace.activeEditor.editor;
+        }
+        const markdownLeaf = this.app.workspace.getLeavesOfType('markdown')[0];
+        if (markdownLeaf?.view instanceof MarkdownView) {
+            return markdownLeaf.view.editor;
+        }
+        return undefined;
+    }
+
     private openUploadModal(editor?: Editor) {
         if (!this.isConnected()) {
             new Notice('please connect to Google Drive first (in settings).');
@@ -131,6 +287,8 @@ export default class DriveEmbedderPlugin extends Plugin {
             new Notice('uploader initialization failed. please check settings.');
             return;
         }
+
+        const initialEditor = this.getActiveMarkdownEditor(editor);
 
         new UploadModal(
             this.app,
@@ -145,11 +303,14 @@ export default class DriveEmbedderPlugin extends Plugin {
                         result.embedOptions
                     );
 
-                    if (editor) {
-                        // Insert at cursor position
-                        editor.replaceSelection(embedCode);
+                    const targetEditor = this.getActiveMarkdownEditor(initialEditor);
+                    if (targetEditor) {
+                        // Insert at cursor position in the active note
+                        targetEditor.replaceSelection(embedCode);
+                        setTimeout(() => this.hydrateDriveEmbeds(document.body), 100);
+                        new Notice('✅ Link & embed inserted into note!');
                     } else {
-                        // Copy to clipboard
+                        // Fallback: copy to clipboard if no Markdown note is open
                         await navigator.clipboard.writeText(embedCode);
                         new Notice('📋 embed code copied to clipboard!');
                     }

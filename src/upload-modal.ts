@@ -139,7 +139,7 @@ export class UploadModal extends Modal {
 
     private processFile(file: File) {
         // Check if file type is supported
-        const fileInfo = getFileTypeInfo(file.name);
+        const fileInfo = getFileTypeInfo(file.name, file.type);
         if (!fileInfo) {
             new Notice('unsupported file type.');
             return;

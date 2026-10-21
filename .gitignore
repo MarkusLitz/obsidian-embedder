@@ -13,6 +13,7 @@ node_modules/
 
 # Obsidian
 .obsidian/
+data.json
 
 # Logs
 *.log

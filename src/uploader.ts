@@ -22,6 +22,8 @@ export class GoogleDriveUploader {
 
     private config: GoogleDriveConfig;
     private oauthFlow: GoogleOAuthFlow;
+    private blobCache: Map<string, { blobUrl: string; mimeType: string }> = new Map();
+    private inflightDownloads: Map<string, Promise<{ blobUrl: string; mimeType: string } | null>> = new Map();
 
     constructor(config: GoogleDriveConfig) {
         this.config = config;
@@ -44,6 +46,65 @@ export class GoogleDriveUploader {
      */
     isConnected(): boolean {
         return !!(this.config.accessToken && this.config.refreshToken);
+    }
+
+    /**
+     * Download a private file from Google Drive via authenticated API and return a local Blob URL
+     */
+    async downloadFileAsBlobUrl(fileId: string): Promise<{ blobUrl: string; mimeType: string } | null> {
+        const cached = this.blobCache.get(fileId);
+        if (cached) {
+            return cached;
+        }
+
+        const inflight = this.inflightDownloads.get(fileId);
+        if (inflight) {
+            return inflight;
+        }
+
+        const downloadPromise = (async () => {
+            try {
+                const accessToken = await this.ensureValidToken();
+                const response = await requestUrl({
+                    url: `${this.API_URL}/files/${encodeURIComponent(fileId)}?alt=media`,
+                    method: 'GET',
+                    headers: {
+                        'Authorization': `Bearer ${accessToken}`
+                    }
+                });
+
+                if (response.status !== 200) {
+                    return null;
+                }
+
+                const rawType = response.headers['content-type'] || response.headers['Content-Type'] || 'application/octet-stream';
+                const mimeType = rawType.split(';')[0].trim();
+                const blob = new Blob([response.arrayBuffer], { type: mimeType });
+                const blobUrl = URL.createObjectURL(blob);
+                const entry = { blobUrl, mimeType };
+                this.blobCache.set(fileId, entry);
+                return entry;
+            } catch (error) {
+                console.error(`Failed to load private Drive file (${fileId}):`, error);
+                return null;
+            } finally {
+                this.inflightDownloads.delete(fileId);
+            }
+        })();
+
+        this.inflightDownloads.set(fileId, downloadPromise);
+        return downloadPromise;
+    }
+
+    /**
+     * Revoke all cached Blob URLs
+     */
+    revokeAllBlobUrls(): void {
+        for (const entry of this.blobCache.values()) {
+            URL.createObjectURL && URL.revokeObjectURL(entry.blobUrl);
+        }
+        this.blobCache.clear();
+        this.inflightDownloads.clear();
     }
 
     /**
@@ -149,19 +210,21 @@ export class GoogleDriveUploader {
             const fileData = uploadResponse.json;
             const fileId = fileData.id;
 
-            // Stage 3: Setting permission
-            onProgress?.({
-                stage: 'setting-permission',
-                message: 'Setting public access...',
-                progress: 70
-            });
+            // Pre-cache local Blob URL so private embed renders immediately without extra download
+            try {
+                const localBlob = new Blob([arrayBuffer], { type: file.type || 'application/octet-stream' });
+                this.blobCache.set(fileId, {
+                    blobUrl: URL.createObjectURL(localBlob),
+                    mimeType: file.type || 'application/octet-stream'
+                });
+            } catch (cacheErr) {
+                console.debug('Could not pre-cache blob URL:', cacheErr);
+            }
 
-            await this.makeFilePublic(fileId);
-
-            // Get updated file info
+            // Get updated file info (file remains private to the owner's Google account)
             const fileInfo = await this.getFileInfo(fileId);
 
-            // Stage 4: Complete
+            // Stage 3: Complete
             onProgress?.({
                 stage: 'complete',
                 message: 'Upload complete!',
@@ -186,31 +249,6 @@ export class GoogleDriveUploader {
                 error: message
             });
             return null;
-        }
-    }
-
-    /**
-     * Make a file publicly accessible
-     */
-    private async makeFilePublic(fileId: string): Promise<void> {
-        try {
-            const accessToken = await this.ensureValidToken();
-
-            await requestUrl({
-                url: `${this.API_URL}/files/${fileId}/permissions`,
-                method: 'POST',
-                headers: {
-                    'Authorization': `Bearer ${accessToken}`,
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    role: 'reader',
-                    type: 'anyone'
-                })
-            });
-        } catch (error) {
-            console.error('Failed to make file public:', error);
-            // Don't throw - file is uploaded, just not public
         }
     }
 

@@ -3,9 +3,7 @@
  * Handles token acquisition and refresh for Google Drive API
  */
 import { Notice, requestUrl } from 'obsidian';
-import { shell } from 'electron';
-import * as http from 'http';
-import * as url from 'url';
+import type * as httpTypes from 'http';
 import { OAuthTokens } from './types';
 
 export interface OAuthConfig {
@@ -23,16 +21,41 @@ export class GoogleOAuthFlow {
     ];
 
     private config: OAuthConfig;
-    private server: http.Server | null = null;
+    private server: httpTypes.Server | null = null;
 
     constructor(config: OAuthConfig) {
         this.config = config;
     }
 
     /**
+     * Cancel any running OAuth callback server
+     */
+    cancel(): void {
+        this.cleanup();
+    }
+
+    /**
      * Start the OAuth flow - opens browser and waits for callback
      */
     async startOAuthFlow(): Promise<OAuthTokens> {
+        // Ensure any previous server is closed first
+        this.cleanup();
+
+        let shell: typeof import('electron').shell;
+        let http: typeof import('http');
+        let url: typeof import('url');
+        try {
+            // Lazy-load desktop modules so the plugin can load on Android/mobile
+            // eslint-disable-next-line @typescript-eslint/no-var-requires
+            shell = (require('electron') as typeof import('electron')).shell;
+            // eslint-disable-next-line @typescript-eslint/no-var-requires
+            http = require('http') as typeof import('http');
+            // eslint-disable-next-line @typescript-eslint/no-var-requires
+            url = require('url') as typeof import('url');
+        } catch (e) {
+            throw new Error('Initial OAuth login must be done on Desktop (macOS/Windows/Linux). Once connected, synced tokens work on Android too.');
+        }
+
         // Generate PKCE code verifier and challenge for security
         const codeVerifier = this.generateCodeVerifier();
         const codeChallenge = await this.generateCodeChallenge(codeVerifier);
@@ -41,78 +64,125 @@ export class GoogleOAuthFlow {
         const redirectUri = `http://localhost:${this.config.redirectPort}/callback`;
 
         return new Promise((resolve, reject) => {
-            try {
+            let settled = false;
+            let timeoutId: ReturnType<typeof setTimeout> | null = null;
 
-                this.server = http.createServer(async (req, res) => {
+            const finishCleanup = (srv: httpTypes.Server | null) => {
+                if (timeoutId) {
+                    clearTimeout(timeoutId);
+                    timeoutId = null;
+                }
+                this.cleanupServer(srv);
+            };
+
+            try {
+                const server = http.createServer(async (req, res) => {
                     try {
                         const parsedUrl = url.parse(req.url || '', true);
 
-                        if (parsedUrl.pathname === '/callback') {
-                            const code = parsedUrl.query.code as string;
-                            const error = parsedUrl.query.error as string;
+                        if (parsedUrl.pathname !== '/callback') {
+                            res.writeHead(404, {
+                                'Content-Type': 'text/plain; charset=utf-8',
+                                'Connection': 'close'
+                            });
+                            res.end('Not found');
+                            return;
+                        }
 
-                            if (error) {
-                                res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-                                res.end(this.getErrorHtml(error));
-                                this.cleanup();
+                        const code = parsedUrl.query.code as string;
+                        const error = parsedUrl.query.error as string;
+
+                        if (error) {
+                            res.writeHead(200, {
+                                'Content-Type': 'text/html; charset=utf-8',
+                                'Connection': 'close'
+                            });
+                            res.end(this.getErrorHtml(error));
+                            finishCleanup(server);
+                            if (!settled) {
+                                settled = true;
                                 reject(new Error(`OAuth error: ${error}`));
-                                return;
                             }
+                            return;
+                        }
 
-                            if (code) {
-                                try {
-                                    // Exchange code for tokens
-                                    const tokens = await this.exchangeCodeForTokens(code, codeVerifier, redirectUri);
+                        if (code) {
+                            try {
+                                // Exchange code for tokens
+                                const tokens = await this.exchangeCodeForTokens(code, codeVerifier, redirectUri);
 
-                                    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-                                    res.end(this.getSuccessHtml());
-                                    this.cleanup();
+                                res.writeHead(200, {
+                                    'Content-Type': 'text/html; charset=utf-8',
+                                    'Connection': 'close'
+                                });
+                                res.end(this.getSuccessHtml());
+                                finishCleanup(server);
+                                if (!settled) {
+                                    settled = true;
                                     resolve(tokens);
-                                } catch (tokenError) {
-                                    const errorMessage = tokenError instanceof Error ? tokenError.message : String(tokenError);
-                                    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-                                    res.end(this.getErrorHtml(errorMessage));
-                                    this.cleanup();
+                                }
+                            } catch (tokenError) {
+                                const errorMessage = tokenError instanceof Error ? tokenError.message : String(tokenError);
+                                res.writeHead(200, {
+                                    'Content-Type': 'text/html; charset=utf-8',
+                                    'Connection': 'close'
+                                });
+                                res.end(this.getErrorHtml(errorMessage));
+                                finishCleanup(server);
+                                if (!settled) {
+                                    settled = true;
                                     reject(tokenError instanceof Error ? tokenError : new Error(errorMessage));
                                 }
                             }
                         }
                     } catch (err) {
-                        reject(err instanceof Error ? err : new Error(String(err)));
+                        finishCleanup(server);
+                        if (!settled) {
+                            settled = true;
+                            reject(err instanceof Error ? err : new Error(String(err)));
+                        }
                     }
                 });
 
-                this.server.listen(this.config.redirectPort, () => {
-                    console.debug(`OAuth callback server listening on port ${this.config.redirectPort}`);
-                });
+                this.server = server;
 
-                // Handle server errors
-                this.server.on('error', (err: NodeJS.ErrnoException) => {
-                    if (err.code === 'EADDRINUSE') {
-                        reject(new Error(`Port ${this.config.redirectPort} is already in use. Please close other applications using this port.`));
-                    } else {
-                        reject(err instanceof Error ? err : new Error(String(err)));
+                // Handle server errors before or during listen
+                server.on('error', (err: NodeJS.ErrnoException) => {
+                    finishCleanup(server);
+                    if (!settled) {
+                        settled = true;
+                        if (err.code === 'EADDRINUSE') {
+                            reject(new Error(`Port ${this.config.redirectPort} is already in use. Please reload Obsidian (Cmd+R) and try again.`));
+                        } else {
+                            reject(err instanceof Error ? err : new Error(String(err)));
+                        }
                     }
                 });
 
-                // Build authorization URL
-                const authUrl = this.buildAuthUrl(redirectUri, codeChallenge);
+                // Only open the browser AFTER the server is actually listening
+                server.listen(this.config.redirectPort, '127.0.0.1', () => {
+                    console.debug(`OAuth callback server listening on 127.0.0.1:${this.config.redirectPort}`);
 
-                // Open browser
-                new Notice('please log in with Google in your browser...', 3000);
-                void shell.openExternal(authUrl);
+                    const authUrl = this.buildAuthUrl(redirectUri, codeChallenge);
+                    new Notice('please log in with Google in your browser...', 3000);
+                    void shell.openExternal(authUrl);
+                });
 
                 // Set timeout (2 minutes)
-                setTimeout(() => {
-                    if (this.server) {
-                        this.cleanup();
+                timeoutId = setTimeout(() => {
+                    finishCleanup(server);
+                    if (!settled) {
+                        settled = true;
                         reject(new Error('OAuth flow timed out. Please try again.'));
                     }
                 }, 120000);
 
             } catch (error) {
-                this.cleanup();
-                reject(error instanceof Error ? error : new Error(String(error)));
+                finishCleanup(this.server);
+                if (!settled) {
+                    settled = true;
+                    reject(error instanceof Error ? error : new Error(String(error)));
+                }
             }
         });
     }
@@ -255,13 +325,37 @@ export class GoogleOAuthFlow {
     }
 
     /**
-     * Cleanup server
+     * Cleanup a specific server instance
      */
-    private cleanup(): void {
-        if (this.server) {
-            this.server.close();
+    private cleanupServer(srv: http.Server | null): void {
+        if (!srv) return;
+        try {
+            if (typeof srv.closeAllConnections === 'function') {
+                srv.closeAllConnections();
+            }
+            srv.close();
+        } catch {
+            // Ignore errors during close
+        }
+        if (this.server === srv) {
             this.server = null;
         }
+    }
+
+    /**
+     * Cleanup current server
+     */
+    private cleanup(): void {
+        this.cleanupServer(this.server);
+    }
+
+    private escapeHtml(value: string): string {
+        return value
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
     }
 
     /**
@@ -325,6 +419,7 @@ export class GoogleOAuthFlow {
      * Error HTML page
      */
     private getErrorHtml(error: string): string {
+        const safeError = this.escapeHtml(error);
         return `
 <!DOCTYPE html>
 <html>
@@ -375,7 +470,7 @@ export class GoogleOAuthFlow {
         <div class="error-icon">❌</div>
         <h1>Connection failed</h1>
         <p>Failed to connect to Google Drive.</p>
-        <div class="error-detail">${error}</div>
+        <div class="error-detail">${safeError}</div>
         <p>Please try again in Obsidian.</p>
     </div>
 </body>

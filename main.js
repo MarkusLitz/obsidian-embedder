@@ -61,9 +61,6 @@ var DEFAULT_SETTINGS = {
 
 // src/google-oauth-flow.ts
 var import_obsidian = require("obsidian");
-var import_electron = require("electron");
-var http = __toESM(require("http"));
-var url = __toESM(require("url"));
 var GoogleOAuthFlow = class {
   constructor(config) {
     this.AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
@@ -75,70 +72,130 @@ var GoogleOAuthFlow = class {
     this.server = null;
     this.config = config;
   }
+  cancel() {
+    this.cleanup();
+  }
   /**
    * Start the OAuth flow - opens browser and waits for callback
    */
   async startOAuthFlow() {
+    this.cleanup();
+    let import_electron;
+    let http;
+    let url;
+    try {
+      import_electron = require("electron");
+      http = __toESM(require("http"));
+      url = __toESM(require("url"));
+    } catch (e) {
+      throw new Error("Initial OAuth login must be done on Desktop (macOS/Windows/Linux). Once connected, synced tokens work on Android too.");
+    }
     const codeVerifier = this.generateCodeVerifier();
     const codeChallenge = await this.generateCodeChallenge(codeVerifier);
     const redirectUri = `http://localhost:${this.config.redirectPort}/callback`;
     return new Promise((resolve, reject) => {
+      let settled = false;
+      let timeoutId = null;
+      const finishCleanup = (srv) => {
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+          timeoutId = null;
+        }
+        this.cleanupServer(srv);
+      };
       try {
-        this.server = http.createServer(async (req, res) => {
+        const server = http.createServer(async (req, res) => {
           try {
             const parsedUrl = url.parse(req.url || "", true);
-            if (parsedUrl.pathname === "/callback") {
-              const code = parsedUrl.query.code;
-              const error = parsedUrl.query.error;
-              if (error) {
-                res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-                res.end(this.getErrorHtml(error));
-                this.cleanup();
+            if (parsedUrl.pathname !== "/callback") {
+              res.writeHead(404, {
+                "Content-Type": "text/plain; charset=utf-8",
+                "Connection": "close"
+              });
+              res.end("Not found");
+              return;
+            }
+            const code = parsedUrl.query.code;
+            const error = parsedUrl.query.error;
+            if (error) {
+              res.writeHead(200, {
+                "Content-Type": "text/html; charset=utf-8",
+                "Connection": "close"
+              });
+              res.end(this.getErrorHtml(error));
+              finishCleanup(server);
+              if (!settled) {
+                settled = true;
                 reject(new Error(`OAuth error: ${error}`));
-                return;
               }
-              if (code) {
-                try {
-                  const tokens = await this.exchangeCodeForTokens(code, codeVerifier, redirectUri);
-                  res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-                  res.end(this.getSuccessHtml());
-                  this.cleanup();
+              return;
+            }
+            if (code) {
+              try {
+                const tokens = await this.exchangeCodeForTokens(code, codeVerifier, redirectUri);
+                res.writeHead(200, {
+                  "Content-Type": "text/html; charset=utf-8",
+                  "Connection": "close"
+                });
+                res.end(this.getSuccessHtml());
+                finishCleanup(server);
+                if (!settled) {
+                  settled = true;
                   resolve(tokens);
-                } catch (tokenError) {
-                  const errorMessage = tokenError instanceof Error ? tokenError.message : String(tokenError);
-                  res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-                  res.end(this.getErrorHtml(errorMessage));
-                  this.cleanup();
+                }
+              } catch (tokenError) {
+                const errorMessage = tokenError instanceof Error ? tokenError.message : String(tokenError);
+                res.writeHead(200, {
+                  "Content-Type": "text/html; charset=utf-8",
+                  "Connection": "close"
+                });
+                res.end(this.getErrorHtml(errorMessage));
+                finishCleanup(server);
+                if (!settled) {
+                  settled = true;
                   reject(tokenError instanceof Error ? tokenError : new Error(errorMessage));
                 }
               }
             }
           } catch (err) {
-            reject(err instanceof Error ? err : new Error(String(err)));
+            finishCleanup(server);
+            if (!settled) {
+              settled = true;
+              reject(err instanceof Error ? err : new Error(String(err)));
+            }
           }
         });
-        this.server.listen(this.config.redirectPort, () => {
-          console.debug(`OAuth callback server listening on port ${this.config.redirectPort}`);
-        });
-        this.server.on("error", (err) => {
-          if (err.code === "EADDRINUSE") {
-            reject(new Error(`Port ${this.config.redirectPort} is already in use. Please close other applications using this port.`));
-          } else {
-            reject(err instanceof Error ? err : new Error(String(err)));
+        this.server = server;
+        server.on("error", (err) => {
+          finishCleanup(server);
+          if (!settled) {
+            settled = true;
+            if (err.code === "EADDRINUSE") {
+              reject(new Error(`Port ${this.config.redirectPort} is already in use. Please reload Obsidian (Cmd+R) and try again.`));
+            } else {
+              reject(err instanceof Error ? err : new Error(String(err)));
+            }
           }
         });
-        const authUrl = this.buildAuthUrl(redirectUri, codeChallenge);
-        new import_obsidian.Notice("please log in with Google in your browser...", 3e3);
-        void import_electron.shell.openExternal(authUrl);
-        setTimeout(() => {
-          if (this.server) {
-            this.cleanup();
+        server.listen(this.config.redirectPort, "127.0.0.1", () => {
+          console.debug(`OAuth callback server listening on 127.0.0.1:${this.config.redirectPort}`);
+          const authUrl = this.buildAuthUrl(redirectUri, codeChallenge);
+          new import_obsidian.Notice("please log in with Google in your browser...", 3e3);
+          void import_electron.shell.openExternal(authUrl);
+        });
+        timeoutId = setTimeout(() => {
+          finishCleanup(server);
+          if (!settled) {
+            settled = true;
             reject(new Error("OAuth flow timed out. Please try again."));
           }
         }, 12e4);
       } catch (error) {
-        this.cleanup();
-        reject(error instanceof Error ? error : new Error(String(error)));
+        finishCleanup(this.server);
+        if (!settled) {
+          settled = true;
+          reject(error instanceof Error ? error : new Error(String(error)));
+        }
       }
     });
   }
@@ -259,14 +316,28 @@ var GoogleOAuthFlow = class {
     }
     return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   }
+  cleanupServer(srv) {
+    if (!srv)
+      return;
+    try {
+      if (typeof srv.closeAllConnections === "function") {
+        srv.closeAllConnections();
+      }
+      srv.close();
+    } catch (e) {
+    }
+    if (this.server === srv) {
+      this.server = null;
+    }
+  }
   /**
    * Cleanup server
    */
   cleanup() {
-    if (this.server) {
-      this.server.close();
-      this.server = null;
-    }
+    this.cleanupServer(this.server);
+  }
+  escapeHtml(value) {
+    return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
   }
   /**
    * Success HTML page
@@ -328,6 +399,7 @@ var GoogleOAuthFlow = class {
    * Error HTML page
    */
   getErrorHtml(error) {
+    const safeError = this.escapeHtml(error);
     return `
 <!DOCTYPE html>
 <html>
@@ -378,7 +450,7 @@ var GoogleOAuthFlow = class {
         <div class="error-icon">\u274C</div>
         <h1>Connection failed</h1>
         <p>Failed to connect to Google Drive.</p>
-        <div class="error-detail">${error}</div>
+        <div class="error-detail">${safeError}</div>
         <p>Please try again in Obsidian.</p>
     </div>
 </body>
@@ -394,6 +466,8 @@ var GoogleDriveUploader = class {
     this.API_URL = "https://www.googleapis.com/drive/v3";
     this.UPLOAD_URL = "https://www.googleapis.com/upload/drive/v3";
     this.REDIRECT_PORT = 8586;
+    this.blobCache = new Map();
+    this.inflightDownloads = new Map();
     this.config = config;
     this.oauthFlow = new GoogleOAuthFlow({
       clientId: config.clientId,
@@ -412,6 +486,58 @@ var GoogleDriveUploader = class {
    */
   isConnected() {
     return !!(this.config.accessToken && this.config.refreshToken);
+  }
+  /**
+   * Download a private file from Google Drive via authenticated API and return a local Blob URL
+   */
+  async downloadFileAsBlobUrl(fileId) {
+    const cached = this.blobCache.get(fileId);
+    if (cached) {
+      return cached;
+    }
+    const inflight = this.inflightDownloads.get(fileId);
+    if (inflight) {
+      return inflight;
+    }
+    const downloadPromise = (async () => {
+      try {
+        const accessToken = await this.ensureValidToken();
+        const response = await (0, import_obsidian2.requestUrl)({
+          url: `${this.API_URL}/files/${encodeURIComponent(fileId)}?alt=media`,
+          method: "GET",
+          headers: {
+            "Authorization": `Bearer ${accessToken}`
+          }
+        });
+        if (response.status !== 200) {
+          return null;
+        }
+        const rawType = response.headers["content-type"] || response.headers["Content-Type"] || "application/octet-stream";
+        const mimeType = rawType.split(";")[0].trim();
+        const blob = new Blob([response.arrayBuffer], { type: mimeType });
+        const blobUrl = URL.createObjectURL(blob);
+        const entry = { blobUrl, mimeType };
+        this.blobCache.set(fileId, entry);
+        return entry;
+      } catch (error) {
+        console.error(`Failed to load private Drive file (${fileId}):`, error);
+        return null;
+      } finally {
+        this.inflightDownloads.delete(fileId);
+      }
+    })();
+    this.inflightDownloads.set(fileId, downloadPromise);
+    return downloadPromise;
+  }
+  /**
+   * Revoke all cached Blob URLs
+   */
+  revokeAllBlobUrls() {
+    for (const entry of this.blobCache.values()) {
+      URL.revokeObjectURL(entry.blobUrl);
+    }
+    this.blobCache.clear();
+    this.inflightDownloads.clear();
   }
   /**
    * Ensure we have a valid access token, refreshing if necessary
@@ -487,12 +613,15 @@ Content-Transfer-Encoding: base64\r
       }
       const fileData = uploadResponse.json;
       const fileId = fileData.id;
-      onProgress == null ? void 0 : onProgress({
-        stage: "setting-permission",
-        message: "Setting public access...",
-        progress: 70
-      });
-      await this.makeFilePublic(fileId);
+      try {
+        const localBlob = new Blob([arrayBuffer], { type: file.type || "application/octet-stream" });
+        this.blobCache.set(fileId, {
+          blobUrl: URL.createObjectURL(localBlob),
+          mimeType: file.type || "application/octet-stream"
+        });
+      } catch (cacheErr) {
+        console.debug("Could not pre-cache blob URL:", cacheErr);
+      }
       const fileInfo = await this.getFileInfo(fileId);
       onProgress == null ? void 0 : onProgress({
         stage: "complete",
@@ -516,28 +645,6 @@ Content-Transfer-Encoding: base64\r
         error: message
       });
       return null;
-    }
-  }
-  /**
-   * Make a file publicly accessible
-   */
-  async makeFilePublic(fileId) {
-    try {
-      const accessToken = await this.ensureValidToken();
-      await (0, import_obsidian2.requestUrl)({
-        url: `${this.API_URL}/files/${fileId}/permissions`,
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${accessToken}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          role: "reader",
-          type: "anyone"
-        })
-      });
-    } catch (error) {
-      console.error("Failed to make file public:", error);
     }
   }
   /**
@@ -838,9 +945,20 @@ var SUPPORTED_FILE_TYPES = [
   { extension: ".webp", mimeType: "image/webp", category: "image", icon: "\u{1F5BC}\uFE0F", label: "WebP image" },
   { extension: ".svg", mimeType: "image/svg+xml", category: "image", icon: "\u{1F5BC}\uFE0F", label: "SVG image" }
 ];
-function getFileTypeInfo(fileName) {
-  const ext = fileName.toLowerCase().substring(fileName.lastIndexOf("."));
-  return SUPPORTED_FILE_TYPES.find((ft) => ft.extension === ext) || null;
+function getFileTypeInfo(fileName, mimeType) {
+  const dotIndex = fileName.lastIndexOf(".");
+  if (dotIndex !== -1) {
+    const ext = fileName.toLowerCase().substring(dotIndex);
+    const byExt = SUPPORTED_FILE_TYPES.find((ft) => ft.extension === ext);
+    if (byExt) {
+      return byExt;
+    }
+  }
+  if (mimeType) {
+    const normalizedMime = mimeType.toLowerCase().split(";")[0].trim();
+    return SUPPORTED_FILE_TYPES.find((ft) => ft.mimeType === normalizedMime) || null;
+  }
+  return null;
 }
 function getSizePresets(category) {
   return SIZE_PRESETS[category] || SIZE_PRESETS.document;
@@ -849,7 +967,13 @@ function getRecommendedSize(category) {
   const presets = getSizePresets(category);
   return presets.find((p) => p.recommended) || presets[0];
 }
-var SUPPORTED_EXTENSIONS = SUPPORTED_FILE_TYPES.map((ft) => ft.extension);
+var SUPPORTED_EXTENSIONS = [
+  ...SUPPORTED_FILE_TYPES.map((ft) => ft.extension),
+  "image/*",
+  "video/*",
+  "audio/*",
+  "application/pdf"
+];
 
 // src/upload-modal.ts
 var UploadModal = class extends import_obsidian3.Modal {
@@ -937,7 +1061,7 @@ var UploadModal = class extends import_obsidian3.Modal {
     }
   }
   processFile(file) {
-    const fileInfo = getFileTypeInfo(file.name);
+    const fileInfo = getFileTypeInfo(file.name, file.type);
     if (!fileInfo) {
       new import_obsidian3.Notice("unsupported file type.");
       return;
@@ -1129,21 +1253,29 @@ var UploadModal = class extends import_obsidian3.Modal {
 
 // src/embed-generator.ts
 var EmbedGenerator = class {
+  escapeHtmlAttr(value) {
+    return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
   /**
    * Generate embed code for a file uploaded to Google Drive
    */
   generateEmbed(fileName, uploadResult, options) {
-    const fileInfo = getFileTypeInfo(fileName);
+    const fileInfo = getFileTypeInfo(fileName, uploadResult.mimeType);
     const { size, showTitle } = options;
+    const safeMarkdownName = fileName.replace(/[[\]]/g, "\\$&");
+    const viewUrl = uploadResult.webViewLink || `https://drive.google.com/file/d/${uploadResult.fileId}/view`;
     let embedCode = "";
     if (showTitle) {
-      embedCode += `**\u{1F4C1} ${fileName}**
+      embedCode += `**[\u{1F4C1} ${safeMarkdownName}](${viewUrl})**
+
+`;
+    } else {
+      embedCode += `[\u{1F4C1} ${safeMarkdownName}](${viewUrl})
 
 `;
     }
     if (!fileInfo) {
-      embedCode += this.generateGenericEmbed(uploadResult);
-      return embedCode;
+      return embedCode.trimEnd();
     }
     switch (fileInfo.category) {
       case "video":
@@ -1156,10 +1288,10 @@ var EmbedGenerator = class {
         embedCode += this.generateDocumentEmbed(uploadResult, size);
         break;
       case "image":
-        embedCode += this.generateImageEmbed(uploadResult, size, fileName);
+        embedCode += this.generateImageEmbed(uploadResult, size, this.escapeHtmlAttr(fileName));
         break;
       default:
-        embedCode += this.generateGenericEmbed(uploadResult);
+        break;
     }
     return embedCode;
   }
@@ -1260,13 +1392,14 @@ var DriveEmbedderPlugin = class extends import_obsidian4.Plugin {
     super(...arguments);
     this.oauthFlow = null;
     this.uploader = null;
+    this.domObserver = null;
   }
   async onload() {
     await this.loadSettings();
     this.embedGenerator = new EmbedGenerator();
     this.initializeServices();
     this.addRibbonIcon("cloud-upload", "Drive Embedder: upload file", () => {
-      this.openUploadModal();
+      this.openUploadModal(this.getActiveMarkdownEditor());
     });
     this.addCommand({
       id: "upload-and-embed",
@@ -1276,9 +1409,15 @@ var DriveEmbedderPlugin = class extends import_obsidian4.Plugin {
       }
     });
     this.addSettingTab(new DriveEmbedderSettingTab(this.app, this));
+    this.setupPrivateEmbedHydration();
     console.debug("Drive Embedder loaded");
   }
   onunload() {
+    var _a, _b, _c;
+    (_a = this.oauthFlow) == null ? void 0 : _a.cancel();
+    (_b = this.domObserver) == null ? void 0 : _b.disconnect();
+    this.domObserver = null;
+    (_c = this.uploader) == null ? void 0 : _c.revokeAllBlobUrls();
     console.debug("Drive Embedder unloaded");
   }
   async loadSettings() {
@@ -1289,16 +1428,20 @@ var DriveEmbedderPlugin = class extends import_obsidian4.Plugin {
     this.initializeServices();
   }
   initializeServices() {
-    if (this.settings.googleClientId && this.settings.googleClientSecret) {
+    var _a;
+    (_a = this.oauthFlow) == null ? void 0 : _a.cancel();
+    const clientId = this.settings.googleClientId.trim();
+    const clientSecret = this.settings.googleClientSecret.trim();
+    if (clientId && clientSecret) {
       this.oauthFlow = new GoogleOAuthFlow({
-        clientId: this.settings.googleClientId,
-        clientSecret: this.settings.googleClientSecret,
+        clientId,
+        clientSecret,
         redirectPort: 8586
       });
       if (this.settings.googleAccessToken) {
         this.uploader = new GoogleDriveUploader({
-          clientId: this.settings.googleClientId,
-          clientSecret: this.settings.googleClientSecret,
+          clientId,
+          clientSecret,
           accessToken: this.settings.googleAccessToken,
           refreshToken: this.settings.googleRefreshToken,
           tokenExpiresAt: this.settings.tokenExpiresAt,
@@ -1309,7 +1452,120 @@ var DriveEmbedderPlugin = class extends import_obsidian4.Plugin {
             await this.saveSettings();
           }
         });
+        this.hydrateDriveEmbeds(document.body);
       }
+    }
+  }
+  setupPrivateEmbedHydration() {
+    this.registerMarkdownPostProcessor((el) => {
+      this.hydrateDriveEmbeds(el);
+    });
+    this.app.workspace.onLayoutReady(() => {
+      this.hydrateDriveEmbeds(document.body);
+    });
+    this.registerEvent(
+      this.app.workspace.on("layout-change", () => {
+        this.hydrateDriveEmbeds(document.body);
+      })
+    );
+    this.registerEvent(
+      this.app.workspace.on("active-leaf-change", () => {
+        this.hydrateDriveEmbeds(document.body);
+      })
+    );
+    this.domObserver = new MutationObserver((mutations) => {
+      for (const mutation of mutations) {
+        for (let i = 0; i < mutation.addedNodes.length; i++) {
+          const node = mutation.addedNodes[i];
+          if (node instanceof HTMLElement) {
+            this.hydrateDriveEmbeds(node);
+          }
+        }
+      }
+    });
+    this.domObserver.observe(document.body, {
+      childList: true,
+      subtree: true
+    });
+  }
+  extractDriveFileId(rawUrl) {
+    if (!rawUrl || !rawUrl.includes("drive.google.com")) {
+      return null;
+    }
+    const idQueryMatch = rawUrl.match(/[?&]id=([a-zA-Z0-9_-]+)/);
+    if (idQueryMatch && idQueryMatch[1]) {
+      return idQueryMatch[1];
+    }
+    const pathMatch = rawUrl.match(/\/file\/d\/([a-zA-Z0-9_-]+)/);
+    if (pathMatch && pathMatch[1]) {
+      return pathMatch[1];
+    }
+    return null;
+  }
+  hydrateDriveEmbeds(root) {
+    if (!this.uploader || !this.isConnected() || !root) {
+      return;
+    }
+    const images = [];
+    if (root instanceof HTMLImageElement) {
+      images.push(root);
+    } else if (root.querySelectorAll) {
+      root.querySelectorAll("img").forEach((img) => images.push(img));
+    }
+    for (const img of images) {
+      const rawSrc = img.getAttribute("src") || "";
+      const fileId = img.dataset.driveFileId || this.extractDriveFileId(rawSrc);
+      if (!fileId || rawSrc.startsWith("blob:") || img.dataset.driveHydrating === "true") {
+        continue;
+      }
+      img.dataset.driveFileId = fileId;
+      img.dataset.driveHydrating = "true";
+      void this.uploader.downloadFileAsBlobUrl(fileId).then((entry) => {
+        img.dataset.driveHydrating = "false";
+        if (entry && entry.blobUrl) {
+          img.src = entry.blobUrl;
+        }
+      });
+    }
+    const iframes = [];
+    if (root instanceof HTMLIFrameElement) {
+      iframes.push(root);
+    } else if (root.querySelectorAll) {
+      root.querySelectorAll("iframe").forEach((iframe) => iframes.push(iframe));
+    }
+    for (const iframe of iframes) {
+      const rawSrc = iframe.getAttribute("src") || "";
+      const fileId = iframe.dataset.driveFileId || this.extractDriveFileId(rawSrc);
+      if (!fileId || rawSrc.startsWith("blob:") || iframe.dataset.driveHydrating === "true") {
+        continue;
+      }
+      iframe.dataset.driveFileId = fileId;
+      iframe.dataset.driveHydrating = "true";
+      void this.uploader.downloadFileAsBlobUrl(fileId).then((entry) => {
+        iframe.dataset.driveHydrating = "false";
+        if (!entry || !entry.blobUrl) {
+          return;
+        }
+        if (entry.mimeType.startsWith("video/")) {
+          const video = document.createElement("video");
+          video.controls = true;
+          video.src = entry.blobUrl;
+          video.style.width = iframe.getAttribute("width") || "100%";
+          video.style.height = iframe.getAttribute("height") || "auto";
+          video.style.borderRadius = "8px";
+          video.style.boxShadow = "0 2px 8px rgba(0,0,0,0.15)";
+          video.style.backgroundColor = "#000";
+          iframe.replaceWith(video);
+        } else if (entry.mimeType.startsWith("audio/")) {
+          const audio = document.createElement("audio");
+          audio.controls = true;
+          audio.src = entry.blobUrl;
+          audio.style.width = "100%";
+          iframe.replaceWith(audio);
+        } else if (entry.mimeType === "application/pdf") {
+          iframe.src = entry.blobUrl;
+        }
+      });
     }
   }
   async startOAuthFlow() {
@@ -1333,6 +1589,8 @@ var DriveEmbedderPlugin = class extends import_obsidian4.Plugin {
     }
   }
   async disconnectGoogleDrive() {
+    var _a;
+    (_a = this.uploader) == null ? void 0 : _a.revokeAllBlobUrls();
     this.settings.googleAccessToken = "";
     this.settings.googleRefreshToken = "";
     this.settings.tokenExpiresAt = 0;
@@ -1343,6 +1601,24 @@ var DriveEmbedderPlugin = class extends import_obsidian4.Plugin {
   isConnected() {
     return !!this.settings.googleAccessToken && !!this.uploader;
   }
+  getActiveMarkdownEditor(preferredEditor) {
+    var _a;
+    if (preferredEditor) {
+      return preferredEditor;
+    }
+    const activeView = this.app.workspace.getActiveViewOfType(import_obsidian4.MarkdownView);
+    if (activeView == null ? void 0 : activeView.editor) {
+      return activeView.editor;
+    }
+    if ((_a = this.app.workspace.activeEditor) == null ? void 0 : _a.editor) {
+      return this.app.workspace.activeEditor.editor;
+    }
+    const markdownLeaf = this.app.workspace.getLeavesOfType("markdown")[0];
+    if ((markdownLeaf == null ? void 0 : markdownLeaf.view) instanceof import_obsidian4.MarkdownView) {
+      return markdownLeaf.view.editor;
+    }
+    return void 0;
+  }
   openUploadModal(editor) {
     if (!this.isConnected()) {
       new import_obsidian4.Notice("please connect to Google Drive first (in settings).");
@@ -1352,6 +1628,7 @@ var DriveEmbedderPlugin = class extends import_obsidian4.Plugin {
       new import_obsidian4.Notice("uploader initialization failed. please check settings.");
       return;
     }
+    const initialEditor = this.getActiveMarkdownEditor(editor);
     new UploadModal(
       this.app,
       this.uploader,
@@ -1364,8 +1641,11 @@ var DriveEmbedderPlugin = class extends import_obsidian4.Plugin {
             result.uploadResult,
             result.embedOptions
           );
-          if (editor) {
-            editor.replaceSelection(embedCode);
+          const targetEditor = this.getActiveMarkdownEditor(initialEditor);
+          if (targetEditor) {
+            targetEditor.replaceSelection(embedCode);
+            setTimeout(() => this.hydrateDriveEmbeds(document.body), 100);
+            new import_obsidian4.Notice("\u2705 Link & embed inserted into note!");
           } else {
             await navigator.clipboard.writeText(embedCode);
             new import_obsidian4.Notice("\u{1F4CB} embed code copied to clipboard!");
