@@ -34,12 +34,19 @@
 - **Robust Active Editor Lookup (`getActiveMarkdownEditor` & `openUploadModal`, `main.js:L1604-L1656`)**:
   - Resolves the target Markdown editor across ribbon clicks and modal closures (`preferredEditor` → `getActiveViewOfType(MarkdownView)` → `workspace.activeEditor` → first `markdown` leaf), inserts the generated snippet, and triggers `hydrateDriveEmbeds` after `100ms`.
 
+### 1.4 Drive File Manager Sidebar & Desktop Hover Delete Button
+- **Sidebar View (`DriveFileManagerView` in `src/file-manager-view.ts`)**:
+  - **Current Note Tab**: Lists all Google Drive embeds in the active Markdown note with live thumbnail/icon previews, one-click size switching (`Compact` / `Medium` / `Large` / `Full width`), Open in Drive, and Delete.
+  - **All Drive Files Tab**: Lists all files uploaded by the plugin (`appProperties has { key='obsidianPlugin' and value='drive-embedder' }`), cross-referenced against all Markdown notes in the vault (`Used in N notes` vs. `Unused` filter + one-click bulk cleanup of unused files).
+- **Desktop Hover Delete Button (`attachEmbedHoverButton` in `main.ts`)**:
+  - Displays a `🗑️ Delete` overlay button in the top-right corner when hovering over any `.drive-embed-container` on Desktop (`!Platform.isMobile`), opening `ConfirmDeleteModal` to remove the entire embed block (link + HTML container) and move the file to the Google Drive trash (`trashed: true`).
+
 ---
 
 ## 2. Telemetry & Third-Party Network Audit
 
 **Status: Clean (No hidden telemetry or third-party data exfiltration)**  
-A full inspection of `main.js` (1,825 lines) confirms that the plugin only communicates with official Google endpoints and a temporary local loopback listener during OAuth login:
+A full inspection of `main.js` confirms that the plugin only communicates with official Google endpoints and a temporary local loopback listener during OAuth login:
 - `https://accounts.google.com/o/oauth2/v2/auth` (`main.js:L66`)
 - `https://oauth2.googleapis.com/token` (`main.js:L67`)
 - `https://www.googleapis.com/drive/v3` & `https://www.googleapis.com/upload/drive/v3` (`main.js:L466-L467`)
@@ -53,15 +60,21 @@ A full inspection of `main.js` (1,825 lines) confirms that the plugin only commu
 ### 3.1 Data Leaks & Credential Security
 
 #### 🔴 [HIGH] Plaintext Storage of OAuth Client Secret & Refresh Token in `data.json`
-- **Location:** `DEFAULT_SETTINGS` (`main.js:L43-L60`), `saveSettings` (`main.js:L1426-L1429`)
+- **Location:** `DEFAULT_SETTINGS` (`src/types.ts`), `saveSettings` (`main.ts`)
 - **Description:** `googleClientId`, `googleClientSecret`, `googleAccessToken`, and `googleRefreshToken` are stored in plaintext inside `.obsidian/plugins/drive-embedder/data.json`.
 - **Impact / Leak Vector:**
   - Because `data.json` resides inside the vault and is synced to mobile devices, any sync provider (Obsidian Sync, iCloud, Google Drive, Syncthing, Git repositories, or unencrypted backups) receives a plaintext copy of `googleClientSecret` and `googleRefreshToken`.
   - Any other installed Obsidian plugin or local process with read access to the vault directory can read `data.json` and mint indefinite access tokens.
-- **Trade-offs & Recommended Solution (Hybrid Encryption):**
-  - *Option 1 (Device-local storage only via Keychain / `localStorage`):* Removes secrets from `data.json`, but breaks automatic token sync to Android.
-  - *Option 2 (Master Password encryption in `data.json` only):* Preserves sync, but requires entering the password on every Obsidian startup.
-  - *Option 3 (Recommended — Encrypted `data.json` + Device-Local Key Cache):* Encrypt `clientSecret`, `accessToken`, and `refreshToken` in `data.json` using Web Crypto API (`AES-256-GCM` with a `PBKDF2`-derived key). Store the decryption key/passphrase in each device's local `window.localStorage` (which is never synced across the vault). This keeps `data.json` safe in cloud sync and backups while requiring password entry only **once per device** (once on Desktop, once on Android) with zero daily UX friction.
+- **Trade-offs & Solution Options:**
+  - **Option 1 — Obsidian Native Keychain (`app.secretStorage` & `SecretComponent`, Obsidian 1.11.4+):**
+    - *How it works:* Uses Obsidian's official cross-platform Keychain API (`this.app.secretStorage.setSecret(id, value)` / `getSecret(id)`) introduced in Obsidian 1.11.4. Secrets are encrypted by the underlying OS keychain (macOS Keychain, Windows DPAPI, Linux Secret Service, Android Keystore, iOS Keychain) and stored outside the `.obsidian` vault folder. `data.json` only stores the secret identifier (e.g., `"drive-embedder-client-secret"` and `"drive-embedder-refresh-token"`).
+    - *Benefits:* Works natively on both Desktop and Mobile (Android/iOS), completely eliminates plaintext credentials from `data.json` / Git / cloud backups, prevents `data.json` sync conflicts when access tokens refresh, and allows `exchangeAuthCodeForTokens()` to programmatically write the `refreshToken` into the keychain upon login.
+    - *Cross-Device Impact (Desktop ↔ Android):* Because OS Keychain entries are intentionally device-local and **not** synced via file sync (Syncthing, iCloud, Git, or Obsidian Sync), a newly added secondary device (e.g., Android) will receive the secret IDs via `data.json`, but not the secret values. The user must populate `clientSecret` and `refreshToken` into the Android keychain **once per device**. After that one-time setup, daily cross-device usage is 100% seamless.
+    - *Recommended UX Enhancement for Mobile Setup:* Add a **"Copy Setup Bundle for Mobile"** button on Desktop and an **"Import Credentials to Keychain"** button on Mobile so users can transfer both `clientSecret` and `refreshToken` into the Android Keychain in a single tap without typing long tokens manually.
+  - **Option 2 — Master Password Encryption in `data.json` Only:**
+    - Preserves automatic file sync of credentials across devices, but requires typing the master password on every Obsidian startup.
+  - **Option 3 — Encrypted `data.json` (`AES-256-GCM`) + Device-Local Key Cache (`localStorage`):**
+    - Encrypts `clientSecret`, `accessToken`, and `refreshToken` inside `data.json` using Web Crypto API (`AES-256-GCM` with a `PBKDF2`-derived key) and caches the decryption key in each device's local `window.localStorage`. Keeps `data.json` encrypted in cloud sync/backups while requiring the master password only **once per device**.
 
 #### 🟠 [MEDIUM] "Disconnect" Does Not Revoke Tokens on Google's Servers
 - **Location:** `disconnectGoogleDrive` (`main.js:L1591-L1600`), `GoogleDriveUploader.disconnect` (`main.js:L779-L783`)
@@ -136,12 +149,12 @@ A full inspection of `main.js` (1,825 lines) confirms that the plugin only commu
 
 ## 4. Prioritized Action Plan (Roadmap)
 
-| Priority | Item | Target Location |
-| :--- | :--- | :--- |
-| **P1 (High)** | Implement hybrid credential protection (AES-256-GCM encrypted tokens in `data.json` + device-local key in `localStorage`) | `settings.ts` / `main.ts` (`loadSettings`, `saveSettings`) |
-| **P2 (Medium)** | Escape single quotes & backslashes in Google Drive folder query (`findFolder`) | `uploader.ts` (`main.js:L690`) |
-| **P2 (Medium)** | Revoke OAuth tokens via `https://oauth2.googleapis.com/revoke` on Disconnect | `uploader.ts` / `main.ts` (`main.js:L1591-L1600`) |
-| **P2 (Medium)** | Add OAuth `state` parameter validation & align loopback redirect host (`127.0.0.1`) | `google-oauth-flow.ts` (`main.js:L93-L185`, `L279`) |
-| **P2 (Medium)** | Strict URL parsing in `extractDriveFileId` (`new URL(rawUrl).hostname === "drive.google.com"`) | `main.ts` (`main.js:L1491-L1504`) |
-| **P2 (Medium)** | Add memory cap / LRU eviction to `blobCache` & chunked encoding in `arrayBufferToBase64` | `uploader.ts` (`main.js:L469`, `L493-L541`, `L787-L794`) |
-| **P3 (Low)** | Mask Client Secret input (`type="password"`), remove unused `userinfo.email` scope, and escape HTML/URLs in `EmbedGenerator` | `main.ts` (`L1710`), `google-oauth-flow.ts` (`L70`), `embed-generator.ts` (`L1265`, `L1356`) |
+| Priority | Status | Item | Target Location |
+| :--- | :--- | :--- | :--- |
+| **P1 (High)** | Planned | Integrate Obsidian Keychain (`app.secretStorage` / `SecretComponent`, Obsidian 1.11.4+) with one-click Mobile Setup Bundle import/export (or hybrid `AES-256-GCM` encryption) | `src/types.ts` / `main.ts` (`loadSettings`, `saveSettings`) |
+| **P2 (Medium)** | ✅ Done | Escape single quotes & backslashes in Google Drive folder query (`findFolder`) | `src/uploader.ts` |
+| **P2 (Medium)** | Planned | Revoke OAuth tokens via `https://oauth2.googleapis.com/revoke` on Disconnect | `src/uploader.ts` / `main.ts` |
+| **P2 (Medium)** | Planned | Add OAuth `state` parameter validation & align loopback redirect host (`127.0.0.1`) | `src/google-oauth-flow.ts` |
+| **P2 (Medium)** | Planned | Strict URL parsing in `extractDriveFileId` (`new URL(rawUrl).hostname === "drive.google.com"`) | `main.ts` |
+| **P2 (Medium)** | Planned | Add memory cap / LRU eviction to `blobCache` & chunked encoding in `arrayBufferToBase64` | `src/uploader.ts` |
+| **P3 (Low)** | Planned | Mask Client Secret input (`type="password"`), remove unused `userinfo.email` scope, and escape HTML/URLs in `EmbedGenerator` | `main.ts`, `src/google-oauth-flow.ts`, `src/embed-generator.ts` |
