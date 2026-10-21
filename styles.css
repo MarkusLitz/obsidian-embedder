@@ -870,4 +870,116 @@ body.is-mobile .drive-embed-hover-bar {
     }
 }
 
+/* PDF.js Canvas Embed Viewer (Desktop & Android) */
+.drive-pdf-viewer {
+    width: 100%;
+    border-radius: 8px;
+    overflow: hidden;
+    border: 1px solid var(--background-modifier-border);
+    background: var(--background-secondary);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+    display: flex;
+    flex-direction: column;
+}
 
+.drive-pdf-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 12px;
+    background: var(--background-secondary-alt, var(--background-secondary));
+    border-bottom: 1px solid var(--background-modifier-border);
+    font-size: 12px;
+    min-height: 36px;
+}
+
+.drive-pdf-toolbar-left {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+.drive-pdf-status {
+    font-weight: 600;
+    color: var(--text-normal);
+}
+
+.drive-pdf-zoom-group {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.drive-pdf-zoom-btn {
+    padding: 2px 8px;
+    height: 24px;
+    min-width: 26px;
+    font-size: 13px;
+    font-weight: 600;
+    border-radius: 4px;
+    cursor: pointer;
+    background: var(--background-primary);
+    color: var(--text-normal);
+    border: 1px solid var(--background-modifier-border);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.drive-pdf-zoom-btn:hover {
+    background: var(--background-modifier-hover);
+}
+
+.drive-pdf-zoom-label {
+    min-width: 42px;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-muted);
+    cursor: pointer;
+    user-select: none;
+}
+
+.drive-pdf-open-link {
+    margin-left: 6px;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 500;
+    text-decoration: none;
+    background: var(--background-primary);
+    border: 1px solid var(--background-modifier-border);
+    color: var(--text-muted);
+}
+
+.drive-pdf-open-link:hover {
+    color: var(--text-normal);
+    background: var(--background-modifier-hover);
+    text-decoration: none;
+}
+
+.drive-pdf-pages {
+    width: 100%;
+    overflow-y: auto;
+    overflow-x: auto;
+    padding: 12px;
+    background: var(--background-secondary);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+    box-sizing: border-box;
+}
+
+.drive-pdf-page-wrapper {
+    display: flex;
+    justify-content: center;
+    max-width: 100%;
+}
+
+.drive-pdf-page-canvas {
+    display: block;
+    background: #ffffff;
+    border-radius: 4px;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+}

@@ -22,8 +22,8 @@ export class GoogleDriveUploader {
 
     private config: GoogleDriveConfig;
     private oauthFlow: GoogleOAuthFlow;
-    private blobCache: Map<string, { blobUrl: string; mimeType: string }> = new Map();
-    private inflightDownloads: Map<string, Promise<{ blobUrl: string; mimeType: string } | null>> = new Map();
+    private blobCache: Map<string, { blobUrl: string; mimeType: string; arrayBuffer?: ArrayBuffer }> = new Map();
+    private inflightDownloads: Map<string, Promise<{ blobUrl: string; mimeType: string; arrayBuffer?: ArrayBuffer } | null>> = new Map();
 
     constructor(config: GoogleDriveConfig) {
         this.config = config;
@@ -51,7 +51,7 @@ export class GoogleDriveUploader {
     /**
      * Get cached local Blob URL if available
      */
-    getCachedBlobUrl(fileId: string): { blobUrl: string; mimeType: string } | undefined {
+    getCachedBlobUrl(fileId: string): { blobUrl: string; mimeType: string; arrayBuffer?: ArrayBuffer } | undefined {
         return this.blobCache.get(fileId);
     }
 
@@ -70,7 +70,7 @@ export class GoogleDriveUploader {
     /**
      * Download a private file from Google Drive via authenticated API and return a local Blob URL
      */
-    async downloadFileAsBlobUrl(fileId: string): Promise<{ blobUrl: string; mimeType: string } | null> {
+    async downloadFileAsBlobUrl(fileId: string): Promise<{ blobUrl: string; mimeType: string; arrayBuffer?: ArrayBuffer } | null> {
         if (!/^[a-zA-Z0-9_-]+$/.test(fileId)) {
             return null;
         }
@@ -100,10 +100,29 @@ export class GoogleDriveUploader {
                 }
 
                 const rawType = response.headers['content-type'] || response.headers['Content-Type'] || 'application/octet-stream';
-                const mimeType = rawType.split(';')[0].trim();
+                let mimeType = rawType.split(';')[0].trim().toLowerCase();
+
+                // Inspect magic bytes (%PDF-) so PDFs are reliably detected even if Content-Type is octet-stream
+                if (response.arrayBuffer && response.arrayBuffer.byteLength >= 5) {
+                    const magic = new Uint8Array(response.arrayBuffer, 0, 5);
+                    if (
+                        magic[0] === 0x25 && // %
+                        magic[1] === 0x50 && // P
+                        magic[2] === 0x44 && // D
+                        magic[3] === 0x46 && // F
+                        magic[4] === 0x2d    // -
+                    ) {
+                        mimeType = 'application/pdf';
+                    }
+                }
+
                 const blob = new Blob([response.arrayBuffer], { type: mimeType });
                 const blobUrl = URL.createObjectURL(blob);
-                const entry = { blobUrl, mimeType };
+                const entry: { blobUrl: string; mimeType: string; arrayBuffer?: ArrayBuffer } = {
+                    blobUrl,
+                    mimeType,
+                    arrayBuffer: mimeType === 'application/pdf' ? response.arrayBuffer : undefined
+                };
                 this.blobCache.set(fileId, entry);
                 return entry;
             } catch (error) {
@@ -234,10 +253,12 @@ export class GoogleDriveUploader {
 
             // Pre-cache local Blob URL so private embed renders immediately without extra download
             try {
-                const localBlob = new Blob([arrayBuffer], { type: file.type || 'application/octet-stream' });
+                const normalizedMime = (file.type || 'application/octet-stream').toLowerCase();
+                const localBlob = new Blob([arrayBuffer], { type: normalizedMime });
                 this.blobCache.set(fileId, {
                     blobUrl: URL.createObjectURL(localBlob),
-                    mimeType: file.type || 'application/octet-stream'
+                    mimeType: normalizedMime,
+                    arrayBuffer: normalizedMime === 'application/pdf' ? arrayBuffer : undefined
                 });
             } catch (cacheErr) {
                 console.debug('Could not pre-cache blob URL:', cacheErr);

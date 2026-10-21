@@ -3,7 +3,7 @@
  * Upload local files to Google Drive and embed them in Obsidian notes
  */
 
-import { Plugin, PluginSettingTab, App, Setting, Notice, Editor, MarkdownView, Platform, TFile } from 'obsidian';
+import { Plugin, PluginSettingTab, App, Setting, Notice, Editor, MarkdownView, Platform, TFile, loadPdfJs } from 'obsidian';
 import { DriveEmbedderSettings } from './src/types';
 import { DEFAULT_SETTINGS } from './src/settings';
 import { GoogleOAuthFlow } from './src/google-oauth-flow';
@@ -302,7 +302,7 @@ export default class DriveEmbedderPlugin extends Plugin implements DriveManagerP
                 continue;
             }
             this.attachEmbedHoverButton(iframe, fileId);
-            if (rawSrc.startsWith('blob:') || iframe.dataset.driveHydrating === 'true') {
+            if (iframe.dataset.driveHydrating === 'true' || iframe.dataset.driveHydrated === 'true') {
                 continue;
             }
             iframe.dataset.driveFileId = fileId;
@@ -333,9 +333,190 @@ export default class DriveEmbedderPlugin extends Plugin implements DriveManagerP
                     iframe.replaceWith(audio);
                     this.attachEmbedHoverButton(audio, fileId);
                 } else if (entry.mimeType === 'application/pdf') {
-                    iframe.src = entry.blobUrl;
+                    iframe.dataset.driveHydrated = 'true';
+                    void this.renderPdfWithPdfJs(iframe, fileId, entry);
                 }
             });
+        }
+    }
+
+    /**
+     * Render a private PDF file onto HTML5 canvas elements using Obsidian's built-in PDF.js (loadPdfJs).
+     * Works identically on Desktop (app://obsidian.md) and Mobile (Android/iOS WebView).
+     */
+    private async renderPdfWithPdfJs(
+        iframe: HTMLIFrameElement,
+        fileId: string,
+        entry: { blobUrl: string; mimeType: string; arrayBuffer?: ArrayBuffer }
+    ) {
+        const heightAttr = iframe.getAttribute('height') || '450px';
+        const normalizedHeight = /^\d+$/.test(heightAttr) ? `${heightAttr}px` : heightAttr;
+
+        const viewerEl = document.createElement('div');
+        viewerEl.className = 'drive-pdf-viewer';
+        viewerEl.dataset.driveFileId = fileId;
+
+        const stopBubble = (e: Event) => {
+            e.stopPropagation();
+        };
+        viewerEl.addEventListener('mousedown', stopBubble);
+        viewerEl.addEventListener('pointerdown', stopBubble);
+        viewerEl.addEventListener('click', stopBubble);
+
+        // Top toolbar
+        const toolbarEl = document.createElement('div');
+        toolbarEl.className = 'drive-pdf-toolbar';
+
+        const leftControls = document.createElement('div');
+        leftControls.className = 'drive-pdf-toolbar-left';
+
+        const statusSpan = document.createElement('span');
+        statusSpan.className = 'drive-pdf-status';
+        statusSpan.textContent = '📄 Loading PDF...';
+        leftControls.appendChild(statusSpan);
+
+        const zoomGroup = document.createElement('div');
+        zoomGroup.className = 'drive-pdf-zoom-group';
+
+        const zoomOutBtn = document.createElement('button');
+        zoomOutBtn.type = 'button';
+        zoomOutBtn.className = 'drive-pdf-zoom-btn';
+        zoomOutBtn.title = 'Zoom out';
+        zoomOutBtn.textContent = '−';
+
+        const zoomLabel = document.createElement('span');
+        zoomLabel.className = 'drive-pdf-zoom-label';
+        zoomLabel.textContent = '100%';
+
+        const zoomInBtn = document.createElement('button');
+        zoomInBtn.type = 'button';
+        zoomInBtn.className = 'drive-pdf-zoom-btn';
+        zoomInBtn.title = 'Zoom in';
+        zoomInBtn.textContent = '+';
+
+        const openLink = document.createElement('a');
+        openLink.className = 'drive-pdf-open-link';
+        openLink.href = `https://drive.google.com/file/d/${encodeURIComponent(fileId)}/view`;
+        openLink.target = '_blank';
+        openLink.rel = 'noopener noreferrer';
+        openLink.textContent = '↗ Drive';
+        openLink.title = 'Open PDF in Google Drive';
+
+        zoomGroup.appendChild(zoomOutBtn);
+        zoomGroup.appendChild(zoomLabel);
+        zoomGroup.appendChild(zoomInBtn);
+        zoomGroup.appendChild(openLink);
+        leftControls.appendChild(zoomGroup);
+
+        toolbarEl.appendChild(leftControls);
+        viewerEl.appendChild(toolbarEl);
+
+        // Scrollable pages viewport
+        const pagesContainer = document.createElement('div');
+        pagesContainer.className = 'drive-pdf-pages';
+        pagesContainer.style.height = normalizedHeight;
+        viewerEl.appendChild(pagesContainer);
+
+        iframe.replaceWith(viewerEl);
+        this.attachEmbedHoverButton(viewerEl, fileId);
+
+        try {
+            const pdfjsLib = await loadPdfJs();
+            let rawBuffer = entry.arrayBuffer;
+            if (!rawBuffer) {
+                const resp = await fetch(entry.blobUrl);
+                rawBuffer = await resp.arrayBuffer();
+                entry.arrayBuffer = rawBuffer;
+            }
+
+            // Copy buffer so PDF.js worker transfer does not detach the cached ArrayBuffer
+            const pdfBytes = new Uint8Array(rawBuffer.slice(0));
+            const loadingTask = pdfjsLib.getDocument({
+                data: pdfBytes,
+                isEvalSupported: false
+            });
+            const pdfDoc = await loadingTask.promise;
+            const numPages: number = pdfDoc.numPages || 0;
+            statusSpan.textContent = `📄 ${numPages} ${numPages === 1 ? 'page' : 'pages'}`;
+
+            let currentZoom = 1.0;
+            let renderGeneration = 0;
+
+            const renderAllPages = async (zoom: number) => {
+                const gen = ++renderGeneration;
+                zoomLabel.textContent = `${Math.round(zoom * 100)}%`;
+                pagesContainer.replaceChildren();
+
+                let containerWidth = pagesContainer.clientWidth;
+                if (containerWidth < 100) {
+                    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+                    containerWidth = pagesContainer.clientWidth;
+                }
+                const targetWidth = Math.max(220, (containerWidth || 560) - 28);
+                const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+
+                for (let pageNum = 1; pageNum <= numPages; pageNum++) {
+                    if (gen !== renderGeneration || !viewerEl.isConnected) {
+                        return;
+                    }
+                    const page = await pdfDoc.getPage(pageNum);
+                    if (gen !== renderGeneration || !viewerEl.isConnected) {
+                        return;
+                    }
+                    const unscaledViewport = page.getViewport({ scale: 1 });
+                    const baseScale = targetWidth / Math.max(1, unscaledViewport.width);
+                    const cssScale = baseScale * zoom;
+                    const hiDpiViewport = page.getViewport({ scale: cssScale * dpr });
+
+                    const pageWrapper = document.createElement('div');
+                    pageWrapper.className = 'drive-pdf-page-wrapper';
+
+                    const canvas = document.createElement('canvas');
+                    canvas.className = 'drive-pdf-page-canvas';
+                    canvas.width = Math.floor(hiDpiViewport.width);
+                    canvas.height = Math.floor(hiDpiViewport.height);
+                    canvas.style.width = `${Math.floor(unscaledViewport.width * cssScale)}px`;
+                    canvas.style.height = `${Math.floor(unscaledViewport.height * cssScale)}px`;
+
+                    pageWrapper.appendChild(canvas);
+                    pagesContainer.appendChild(pageWrapper);
+
+                    const ctx = canvas.getContext('2d');
+                    if (ctx) {
+                        await page.render({
+                            canvasContext: ctx,
+                            viewport: hiDpiViewport
+                        }).promise;
+                    }
+                }
+            };
+
+            zoomOutBtn.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                currentZoom = Math.max(0.5, Math.round((currentZoom - 0.25) * 100) / 100);
+                void renderAllPages(currentZoom);
+            });
+
+            zoomInBtn.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                currentZoom = Math.min(2.5, Math.round((currentZoom + 0.25) * 100) / 100);
+                void renderAllPages(currentZoom);
+            });
+
+            zoomLabel.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                currentZoom = 1.0;
+                void renderAllPages(currentZoom);
+            });
+            zoomLabel.title = 'Click to reset zoom to 100%';
+
+            await renderAllPages(currentZoom);
+        } catch (err) {
+            console.error(`Failed to render PDF with PDF.js (${fileId}):`, err);
+            statusSpan.textContent = '⚠️ Could not render PDF preview';
         }
     }
 

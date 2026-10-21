@@ -29,7 +29,7 @@ All notable changes to **Drive Embedder** are documented in this file.
     - Replaces `<img>` `src` with the authenticated `blob:` URL.
     - Replaces video `<iframe>` elements with native HTML5 `<video controls>` players.
     - Replaces audio `<iframe>` elements with native HTML5 `<audio controls>` players.
-    - Updates PDF `<iframe>` `src` to the authenticated `blob:` URL.
+    - Replaces PDF `<iframe>` elements with an interactive **PDF.js `<canvas>` viewer** (`loadPdfJs()` with `isEvalSupported: false`, HiDPI scaling, zoom controls, and `%PDF-` magic-byte detection) so private PDFs render reliably under Obsidian's `app://obsidian.md` scheme on Desktop as well as on Android/iOS WebViews.
 - **Android & Mobile Support (`4ad9017`)**:
   - Set `"isDesktopOnly": false` in `manifest.json`.
   - Lazy-loaded desktop-only Node/Electron modules (`electron`, `http`, `url`) inside `GoogleOAuthFlow.startOAuthFlow()` so the plugin initializes cleanly on Android/iOS and uses synced OAuth tokens via Obsidian's cross-platform `requestUrl`.
