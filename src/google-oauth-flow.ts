@@ -327,7 +327,7 @@ export class GoogleOAuthFlow {
     /**
      * Cleanup a specific server instance
      */
-    private cleanupServer(srv: http.Server | null): void {
+    private cleanupServer(srv: (httpTypes.Server & { closeAllConnections?: () => void }) | null): void {
         if (!srv) return;
         try {
             if (typeof srv.closeAllConnections === 'function') {

@@ -3,15 +3,22 @@
  * Upload local files to Google Drive and embed them in Obsidian notes
  */
 
-import { Plugin, PluginSettingTab, App, Setting, Notice, Editor, MarkdownView } from 'obsidian';
+import { Plugin, PluginSettingTab, App, Setting, Notice, Editor, MarkdownView, Platform, TFile } from 'obsidian';
 import { DriveEmbedderSettings } from './src/types';
 import { DEFAULT_SETTINGS } from './src/settings';
 import { GoogleOAuthFlow } from './src/google-oauth-flow';
 import { GoogleDriveUploader } from './src/uploader';
 import { UploadModal, UploadModalResult } from './src/upload-modal';
 import { EmbedGenerator } from './src/embed-generator';
+import {
+    ConfirmDeleteModal,
+    DriveFileManagerView,
+    DriveManagerPluginHost,
+    VIEW_TYPE_DRIVE_MANAGER
+} from './src/file-manager-view';
+import { removeEmbedFromNote, scanVaultForEmbeds } from './src/embed-scanner';
 
-export default class DriveEmbedderPlugin extends Plugin {
+export default class DriveEmbedderPlugin extends Plugin implements DriveManagerPluginHost {
     settings: DriveEmbedderSettings;
     private oauthFlow: GoogleOAuthFlow | null = null;
     private uploader: GoogleDriveUploader | null = null;
@@ -26,12 +33,23 @@ export default class DriveEmbedderPlugin extends Plugin {
         // Initialize OAuth and uploader if credentials exist
         this.initializeServices();
 
-        // Add ribbon icon
+        // Register sidebar file manager view
+        this.registerView(
+            VIEW_TYPE_DRIVE_MANAGER,
+            (leaf) => new DriveFileManagerView(leaf, this)
+        );
+
+        // Add ribbon icon for uploading
         this.addRibbonIcon('cloud-upload', 'Drive Embedder: upload file', () => {
             this.openUploadModal(this.getActiveMarkdownEditor());
         });
 
-        // Add command
+        // Add ribbon icon for file manager sidebar
+        this.addRibbonIcon('hard-drive', 'Drive Embedder: manage files', () => {
+            void this.activateManagerView();
+        });
+
+        // Add command: upload and embed
         this.addCommand({
             id: 'upload-and-embed',
             name: 'upload file and embed',
@@ -40,11 +58,37 @@ export default class DriveEmbedderPlugin extends Plugin {
             }
         });
 
+        // Add command: open file manager sidebar
+        this.addCommand({
+            id: 'open-drive-file-manager',
+            name: 'manage uploaded Drive files',
+            callback: () => {
+                void this.activateManagerView();
+            }
+        });
+
         // Add settings tab
         this.addSettingTab(new DriveEmbedderSettingTab(this.app, this));
 
         // Hydrate private Google Drive embeds in Reading View and Live Preview
         this.setupPrivateEmbedHydration();
+
+        // Keep sidebar manager view updated on vault modifications
+        this.registerEvent(
+            this.app.vault.on('modify', () => {
+                this.refreshManagerViews(false);
+            })
+        );
+        this.registerEvent(
+            this.app.vault.on('delete', () => {
+                this.refreshManagerViews(true);
+            })
+        );
+        this.registerEvent(
+            this.app.vault.on('rename', () => {
+                this.refreshManagerViews(true);
+            })
+        );
 
         console.debug('Drive Embedder loaded');
     }
@@ -64,6 +108,62 @@ export default class DriveEmbedderPlugin extends Plugin {
     async saveSettings() {
         await this.saveData(this.settings);
         this.initializeServices();
+    }
+
+    getUploader(): GoogleDriveUploader | null {
+        return this.uploader;
+    }
+
+    getEmbedGenerator(): EmbedGenerator {
+        return this.embedGenerator;
+    }
+
+    getShowTitleByDefault(): boolean {
+        return this.settings.showTitleByDefault;
+    }
+
+    openUploadModalFromManager(): void {
+        this.openUploadModal(this.getActiveMarkdownEditor());
+    }
+
+    triggerHydration(): void {
+        this.hydrateDriveEmbeds(document.body);
+    }
+
+    async activateManagerView(): Promise<void> {
+        const { workspace } = this.app;
+        let leaf = workspace.getLeavesOfType(VIEW_TYPE_DRIVE_MANAGER)[0];
+
+        if (!leaf) {
+            const rightLeaf = workspace.getRightLeaf(false);
+            if (rightLeaf) {
+                leaf = rightLeaf;
+                await leaf.setViewState({
+                    type: VIEW_TYPE_DRIVE_MANAGER,
+                    active: true
+                });
+            }
+        }
+
+        if (leaf) {
+            workspace.revealLeaf(leaf);
+            if (leaf.view instanceof DriveFileManagerView) {
+                leaf.view.scheduleRefresh(false);
+            }
+        }
+    }
+
+    private refreshManagerViews(fullVaultScan = false, refreshDrive = false) {
+        const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_DRIVE_MANAGER);
+        for (const leaf of leaves) {
+            if (leaf.view instanceof DriveFileManagerView) {
+                if (refreshDrive) {
+                    void leaf.view.refreshAll();
+                } else {
+                    leaf.view.scheduleRefresh(fullVaultScan);
+                }
+            }
+        }
     }
 
     private initializeServices() {
@@ -93,6 +193,7 @@ export default class DriveEmbedderPlugin extends Plugin {
                     }
                 });
                 this.hydrateDriveEmbeds(document.body);
+                this.refreshManagerViews(true, true);
             }
         }
     }
@@ -109,12 +210,14 @@ export default class DriveEmbedderPlugin extends Plugin {
         this.registerEvent(
             this.app.workspace.on('layout-change', () => {
                 this.hydrateDriveEmbeds(document.body);
+                this.refreshManagerViews(false);
             })
         );
 
         this.registerEvent(
             this.app.workspace.on('active-leaf-change', () => {
                 this.hydrateDriveEmbeds(document.body);
+                this.refreshManagerViews(false);
             })
         );
 
@@ -163,9 +266,16 @@ export default class DriveEmbedderPlugin extends Plugin {
         }
 
         for (const img of images) {
+            if (img.closest('.drive-manager-view')) {
+                continue;
+            }
             const rawSrc = img.getAttribute('src') || '';
             const fileId = img.dataset.driveFileId || this.extractDriveFileId(rawSrc);
-            if (!fileId || rawSrc.startsWith('blob:') || img.dataset.driveHydrating === 'true') {
+            if (!fileId) {
+                continue;
+            }
+            this.attachEmbedHoverButton(img, fileId);
+            if (rawSrc.startsWith('blob:') || img.dataset.driveHydrating === 'true') {
                 continue;
             }
             img.dataset.driveFileId = fileId;
@@ -188,7 +298,11 @@ export default class DriveEmbedderPlugin extends Plugin {
         for (const iframe of iframes) {
             const rawSrc = iframe.getAttribute('src') || '';
             const fileId = iframe.dataset.driveFileId || this.extractDriveFileId(rawSrc);
-            if (!fileId || rawSrc.startsWith('blob:') || iframe.dataset.driveHydrating === 'true') {
+            if (!fileId) {
+                continue;
+            }
+            this.attachEmbedHoverButton(iframe, fileId);
+            if (rawSrc.startsWith('blob:') || iframe.dataset.driveHydrating === 'true') {
                 continue;
             }
             iframe.dataset.driveFileId = fileId;
@@ -202,23 +316,150 @@ export default class DriveEmbedderPlugin extends Plugin {
                     const video = document.createElement('video');
                     video.controls = true;
                     video.src = entry.blobUrl;
+                    video.dataset.driveFileId = fileId;
                     video.style.width = iframe.getAttribute('width') || '100%';
                     video.style.height = iframe.getAttribute('height') || 'auto';
                     video.style.borderRadius = '8px';
                     video.style.boxShadow = '0 2px 8px rgba(0,0,0,0.15)';
                     video.style.backgroundColor = '#000';
                     iframe.replaceWith(video);
+                    this.attachEmbedHoverButton(video, fileId);
                 } else if (entry.mimeType.startsWith('audio/')) {
                     const audio = document.createElement('audio');
                     audio.controls = true;
                     audio.src = entry.blobUrl;
+                    audio.dataset.driveFileId = fileId;
                     audio.style.width = '100%';
                     iframe.replaceWith(audio);
+                    this.attachEmbedHoverButton(audio, fileId);
                 } else if (entry.mimeType === 'application/pdf') {
                     iframe.src = entry.blobUrl;
                 }
             });
         }
+    }
+
+    /**
+     * Attach a desktop-only hover delete button to the top-right corner of an embed container
+     */
+    private attachEmbedHoverButton(mediaEl: HTMLElement, fileId: string) {
+        if (Platform.isMobile) {
+            return;
+        }
+        const parent = mediaEl.parentElement;
+        if (!parent) {
+            return;
+        }
+        const container = parent.tagName === 'A' ? parent.parentElement : parent;
+        if (!(container instanceof HTMLElement) || container.tagName !== 'DIV') {
+            return;
+        }
+        if (
+            container.classList.contains('markdown-preview-view') ||
+            container.classList.contains('markdown-preview-sizer') ||
+            container.classList.contains('cm-content')
+        ) {
+            return;
+        }
+
+        container.classList.add('drive-embed-container');
+        if (container.querySelector('.drive-embed-hover-bar')) {
+            return;
+        }
+
+        const hoverBar = document.createElement('div');
+        hoverBar.className = 'drive-embed-hover-bar';
+
+        const deleteBtn = document.createElement('button');
+        deleteBtn.type = 'button';
+        deleteBtn.className = 'drive-embed-hover-btn danger';
+        deleteBtn.title = 'Delete Google Drive file...';
+        deleteBtn.textContent = '🗑️ Delete';
+
+        const stopEditorUnfold = (e: Event) => {
+            e.preventDefault();
+            e.stopPropagation();
+        };
+        deleteBtn.addEventListener('mousedown', stopEditorUnfold);
+        deleteBtn.addEventListener('pointerdown', stopEditorUnfold);
+        deleteBtn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            void this.openHoverDeleteModal(fileId, mediaEl);
+        });
+
+        hoverBar.appendChild(deleteBtn);
+        container.appendChild(hoverBar);
+    }
+
+    /**
+     * Open confirmation modal when clicking the hover delete button on an embed
+     */
+    private async openHoverDeleteModal(fileId: string, mediaEl: HTMLElement) {
+        // Resolve the Markdown file where this embed was clicked
+        let noteFile: TFile | null = null;
+        for (const leaf of this.app.workspace.getLeavesOfType('markdown')) {
+            if (leaf.view instanceof MarkdownView && leaf.view.containerEl.contains(mediaEl) && leaf.view.file) {
+                noteFile = leaf.view.file;
+                break;
+            }
+        }
+        if (!noteFile) {
+            const active = this.app.workspace.getActiveFile();
+            if (active && active.extension === 'md') {
+                noteFile = active;
+            }
+        }
+
+        const vaultMap = await scanVaultForEmbeds(this.app);
+        const allOccurrences = vaultMap.get(fileId) || [];
+        const matchingInNote = noteFile
+            ? allOccurrences.find(o => o.notePath === noteFile?.path)
+            : undefined;
+
+        const altName = mediaEl.getAttribute('alt') || '';
+        const displayName = matchingInNote?.fileName || allOccurrences[0]?.fileName || altName || fileId;
+
+        new ConfirmDeleteModal(this.app, {
+            fileName: displayName,
+            fileId,
+            mode: noteFile ? 'note' : 'global',
+            currentNoteFile: noteFile || undefined,
+            allOccurrences,
+            onConfirm: async ({ removeFromCurrentNote, removeFromAllNotes, trashOnDrive }) => {
+                if (removeFromAllNotes && allOccurrences.length > 0) {
+                    const uniquePaths = Array.from(new Set(allOccurrences.map(o => o.notePath)));
+                    for (const p of uniquePaths) {
+                        const af = this.app.vault.getAbstractFileByPath(p);
+                        if (af instanceof TFile) {
+                            await removeEmbedFromNote(this.app, af, {
+                                fileId,
+                                removeAllForFileId: true
+                            });
+                        }
+                    }
+                } else if (removeFromCurrentNote && noteFile) {
+                    await removeEmbedFromNote(this.app, noteFile, {
+                        fileId,
+                        charStart: matchingInNote?.charStart,
+                        lineStart: matchingInNote?.lineStart
+                    });
+                }
+
+                if (trashOnDrive && this.uploader) {
+                    const ok = await this.uploader.trashFile(fileId);
+                    if (ok) {
+                        new Notice(`🗑️ Removed from note & moved "${displayName}" to Google Drive trash.`);
+                    } else {
+                        new Notice(`⚠️ Removed from note, but could not move "${displayName}" to Drive trash.`);
+                    }
+                } else {
+                    new Notice(`✅ Removed "${displayName}" embed from note.`);
+                }
+
+                this.refreshManagerViews(true, true);
+            }
+        }).open();
     }
 
     async startOAuthFlow(): Promise<boolean> {
@@ -252,6 +493,7 @@ export default class DriveEmbedderPlugin extends Plugin {
         this.settings.tokenExpiresAt = 0;
         this.uploader = null;
         await this.saveSettings();
+        this.refreshManagerViews(false, false);
         new Notice('disconnected from Google Drive.');
     }
 
@@ -307,11 +549,15 @@ export default class DriveEmbedderPlugin extends Plugin {
                     if (targetEditor) {
                         // Insert at cursor position in the active note
                         targetEditor.replaceSelection(embedCode);
-                        setTimeout(() => this.hydrateDriveEmbeds(document.body), 100);
+                        setTimeout(() => {
+                            this.hydrateDriveEmbeds(document.body);
+                            this.refreshManagerViews(true, true);
+                        }, 100);
                         new Notice('✅ Link & embed inserted into note!');
                     } else {
                         // Fallback: copy to clipboard if no Markdown note is open
                         await navigator.clipboard.writeText(embedCode);
+                        this.refreshManagerViews(true, true);
                         new Notice('📋 embed code copied to clipboard!');
                     }
                 })();

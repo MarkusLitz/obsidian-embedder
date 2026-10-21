@@ -4,7 +4,7 @@
  */
 import { requestUrl, Notice } from 'obsidian';
 import { GoogleOAuthFlow } from './google-oauth-flow';
-import { OAuthTokens, DriveUploadResult, UploadProgress } from './types';
+import { OAuthTokens, DriveUploadResult, UploadProgress, DriveFileMetadata } from './types';
 
 export interface GoogleDriveConfig {
     clientId: string;
@@ -49,9 +49,31 @@ export class GoogleDriveUploader {
     }
 
     /**
+     * Get cached local Blob URL if available
+     */
+    getCachedBlobUrl(fileId: string): { blobUrl: string; mimeType: string } | undefined {
+        return this.blobCache.get(fileId);
+    }
+
+    /**
+     * Revoke and remove a single cached Blob URL
+     */
+    revokeBlobUrl(fileId: string): void {
+        const entry = this.blobCache.get(fileId);
+        if (entry) {
+            URL.revokeObjectURL(entry.blobUrl);
+            this.blobCache.delete(fileId);
+        }
+        this.inflightDownloads.delete(fileId);
+    }
+
+    /**
      * Download a private file from Google Drive via authenticated API and return a local Blob URL
      */
     async downloadFileAsBlobUrl(fileId: string): Promise<{ blobUrl: string; mimeType: string } | null> {
+        if (!/^[a-zA-Z0-9_-]+$/.test(fileId)) {
+            return null;
+        }
         const cached = this.blobCache.get(fileId);
         if (cached) {
             return cached;
@@ -101,7 +123,7 @@ export class GoogleDriveUploader {
      */
     revokeAllBlobUrls(): void {
         for (const entry of this.blobCache.values()) {
-            URL.createObjectURL && URL.revokeObjectURL(entry.blobUrl);
+            URL.revokeObjectURL(entry.blobUrl);
         }
         this.blobCache.clear();
         this.inflightDownloads.clear();
@@ -253,6 +275,123 @@ export class GoogleDriveUploader {
     }
 
     /**
+     * List all non-trashed files uploaded by this plugin to Google Drive
+     */
+    async listUploadedFiles(): Promise<DriveFileMetadata[]> {
+        try {
+            const accessToken = await this.ensureValidToken();
+            const query = "mimeType!='application/vnd.google-apps.folder' and trashed=false";
+            const fields = 'nextPageToken,files(id,name,mimeType,size,createdTime,modifiedTime,webViewLink,trashed)';
+            const results: DriveFileMetadata[] = [];
+            let pageToken = '';
+
+            do {
+                const tokenParam = pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : '';
+                const response = await requestUrl({
+                    url: `${this.API_URL}/files?q=${encodeURIComponent(query)}&fields=${encodeURIComponent(fields)}&orderBy=${encodeURIComponent('createdTime desc')}&pageSize=100${tokenParam}`,
+                    method: 'GET',
+                    headers: {
+                        'Authorization': `Bearer ${accessToken}`
+                    }
+                });
+
+                if (response.status !== 200) {
+                    break;
+                }
+
+                const data = response.json;
+                if (Array.isArray(data.files)) {
+                    for (const f of data.files) {
+                        results.push({
+                            id: String(f.id),
+                            name: String(f.name || f.id),
+                            mimeType: String(f.mimeType || 'application/octet-stream'),
+                            size: f.size !== undefined ? Number(f.size) : undefined,
+                            createdTime: f.createdTime,
+                            modifiedTime: f.modifiedTime,
+                            webViewLink: f.webViewLink || `https://drive.google.com/file/d/${f.id}/view`,
+                            trashed: Boolean(f.trashed)
+                        });
+                    }
+                }
+                pageToken = data.nextPageToken || '';
+            } while (pageToken && results.length < 500);
+
+            return results;
+        } catch (error) {
+            console.error('Error listing Google Drive files:', error);
+            return [];
+        }
+    }
+
+    /**
+     * Get metadata for a single file on Google Drive
+     */
+    async getFileMetadata(fileId: string): Promise<DriveFileMetadata | null> {
+        if (!/^[a-zA-Z0-9_-]+$/.test(fileId)) {
+            return null;
+        }
+        try {
+            const accessToken = await this.ensureValidToken();
+            const response = await requestUrl({
+                url: `${this.API_URL}/files/${encodeURIComponent(fileId)}?fields=id,name,mimeType,size,createdTime,modifiedTime,webViewLink,trashed`,
+                method: 'GET',
+                headers: {
+                    'Authorization': `Bearer ${accessToken}`
+                }
+            });
+
+            if (response.status !== 200) {
+                return null;
+            }
+
+            const f = response.json;
+            return {
+                id: String(f.id),
+                name: String(f.name || f.id),
+                mimeType: String(f.mimeType || 'application/octet-stream'),
+                size: f.size !== undefined ? Number(f.size) : undefined,
+                createdTime: f.createdTime,
+                modifiedTime: f.modifiedTime,
+                webViewLink: f.webViewLink || `https://drive.google.com/file/d/${f.id}/view`,
+                trashed: Boolean(f.trashed)
+            };
+        } catch (error) {
+            return null;
+        }
+    }
+
+    /**
+     * Move a file to the Google Drive trash (trashed = true)
+     */
+    async trashFile(fileId: string): Promise<boolean> {
+        if (!/^[a-zA-Z0-9_-]+$/.test(fileId)) {
+            return false;
+        }
+        try {
+            const accessToken = await this.ensureValidToken();
+            const response = await requestUrl({
+                url: `${this.API_URL}/files/${encodeURIComponent(fileId)}`,
+                method: 'PATCH',
+                headers: {
+                    'Authorization': `Bearer ${accessToken}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ trashed: true })
+            });
+
+            if (response.status >= 200 && response.status < 300) {
+                this.revokeBlobUrl(fileId);
+                return true;
+            }
+            return false;
+        } catch (error) {
+            console.error(`Failed to move Drive file (${fileId}) to trash:`, error);
+            return false;
+        }
+    }
+
+    /**
      * Get file info from Google Drive
      */
     private async getFileInfo(fileId: string): Promise<{ webViewLink?: string; webContentLink?: string }> {
@@ -260,7 +399,7 @@ export class GoogleDriveUploader {
             const accessToken = await this.ensureValidToken();
 
             const response = await requestUrl({
-                url: `${this.API_URL}/files/${fileId}?fields=webViewLink,webContentLink`,
+                url: `${this.API_URL}/files/${encodeURIComponent(fileId)}?fields=webViewLink,webContentLink`,
                 method: 'GET',
                 headers: {
                     'Authorization': `Bearer ${accessToken}`
@@ -299,7 +438,9 @@ export class GoogleDriveUploader {
     private async findFolder(name: string, parentId: string): Promise<string | null> {
         try {
             const accessToken = await this.ensureValidToken();
-            const query = `name='${name}' and '${parentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`;
+            const safeName = name.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+            const safeParentId = parentId.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+            const query = `name='${safeName}' and '${safeParentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`;
 
             const response = await requestUrl({
                 url: `${this.API_URL}/files?q=${encodeURIComponent(query)}&fields=files(id)`,

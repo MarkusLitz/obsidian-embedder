@@ -87,3 +87,33 @@ export interface UploadModalResult {
     title: string;
     showTitle: boolean;
 }
+
+// Metadata for a file stored in Google Drive
+export interface DriveFileMetadata {
+    id: string;
+    name: string;
+    mimeType: string;
+    size?: number;
+    createdTime?: string;
+    modifiedTime?: string;
+    webViewLink?: string;
+    trashed?: boolean;
+}
+
+// Occurrence of a Google Drive embed within an Obsidian Markdown note
+export interface NoteEmbedOccurrence {
+    fileId: string;
+    fileName: string;
+    notePath: string;
+    noteName: string;
+    lineStart: number; // 0-indexed line number
+    lineEnd: number;   // 0-indexed line number (inclusive)
+    charStart: number;
+    charEnd: number;
+    category: ContentCategory;
+    currentWidth?: string;
+    currentHeight?: string;
+    matchedSizeId?: string;
+    showTitle: boolean;
+}
+
