@@ -17,6 +17,7 @@ export class GoogleOAuthFlow {
     private readonly TOKEN_URL = 'https://oauth2.googleapis.com/token';
     private readonly SCOPES = [
         'https://www.googleapis.com/auth/drive.file',
+        'https://www.googleapis.com/auth/drive.metadata.readonly',
         'https://www.googleapis.com/auth/userinfo.email'
     ];
 

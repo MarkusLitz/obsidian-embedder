@@ -7,6 +7,11 @@ All notable changes to **Drive Embedder** are documented in this file.
 ## [Unreleased] — 2026-10-21
 
 ### Added
+- **Multi-File Upload & Batch Embedding (`src/upload-modal.ts`, `main.ts`, `styles.css`)**:
+  - Support selecting or dragging & dropping multiple files at once (`<input type="file" multiple>` and incremental queue additions).
+  - Queue list with per-file size preset dropdowns, individual file removal (`✕`), `Clear all` button, and global size preset cards (supporting both single-category and mixed-category queues).
+  - Sequential batch upload with overall + per-file progress tracking (`[i/N] filename`) and partial-failure recovery (inserts completed files immediately and keeps only failed items in the modal for one-click retry).
+  - Single-step batch insertion (`replaceSelection`) of all generated embeds stacked vertically in the active note.
 - **Sidebar File Manager (`src/file-manager-view.ts`, `src/embed-scanner.ts`, `main.ts`, `styles.css`)**:
   - New dockable sidebar view (`Drive files`) accessible via the `hard-drive` ribbon icon or Command Palette (`Drive Embedder: manage uploaded Drive files`).
   - **📄 Current Note Tab**:
@@ -29,7 +34,7 @@ All notable changes to **Drive Embedder** are documented in this file.
     - Replaces `<img>` `src` with the authenticated `blob:` URL.
     - Replaces video `<iframe>` elements with native HTML5 `<video controls>` players.
     - Replaces audio `<iframe>` elements with native HTML5 `<audio controls>` players.
-    - Replaces PDF `<iframe>` elements with an interactive **PDF.js `<canvas>` viewer** (`loadPdfJs()` with `isEvalSupported: false`, HiDPI scaling, zoom controls, and `%PDF-` magic-byte detection) so private PDFs render reliably under Obsidian's `app://obsidian.md` scheme on Desktop as well as on Android/iOS WebViews.
+    - Replaces PDF `<iframe>` elements with an interactive **PDF.js `<canvas>` viewer** (`loadPdfJs()` with `isEvalSupported: false`, HiDPI scaling, zoom controls, `%PDF-` magic-byte detection, and automatic re-rendering on CodeMirror 6 viewport virtualization / scroll via `ResizeObserver`, `IntersectionObserver`, and `MutationObserver`) so any number of private PDFs render reliably under Obsidian's `app://obsidian.md` scheme on Desktop as well as on Android/iOS WebViews.
 - **Android & Mobile Support (`4ad9017`)**:
   - Set `"isDesktopOnly": false` in `manifest.json`.
   - Lazy-loaded desktop-only Node/Electron modules (`electron`, `http`, `url`) inside `GoogleOAuthFlow.startOAuthFlow()` so the plugin initializes cleanly on Android/iOS and uses synced OAuth tokens via Obsidian's cross-platform `requestUrl`.

@@ -17,6 +17,7 @@ export const DEFAULT_SETTINGS: DriveEmbedderSettings = {
 
     // Embed settings
     showTitleByDefault: true,
+    enableSmartChipsOnPaste: true,
     defaultTheme: 'auto',
 
     // Default sizes per category

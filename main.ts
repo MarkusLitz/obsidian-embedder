@@ -17,21 +17,40 @@ import {
     VIEW_TYPE_DRIVE_MANAGER
 } from './src/file-manager-view';
 import { removeEmbedFromNote, scanVaultForEmbeds } from './src/embed-scanner';
+import {
+    createGoogleSmartChipEditorExtension,
+    decorateGoogleSmartChipLinksInDom,
+    GoogleSmartChipManager
+} from './src/smart-chips';
 
 export default class DriveEmbedderPlugin extends Plugin implements DriveManagerPluginHost {
     settings: DriveEmbedderSettings;
     private oauthFlow: GoogleOAuthFlow | null = null;
     private uploader: GoogleDriveUploader | null = null;
     private embedGenerator: EmbedGenerator;
+    private smartChipManager: GoogleSmartChipManager;
     private domObserver: MutationObserver | null = null;
 
     async onload() {
         await this.loadSettings();
 
         this.embedGenerator = new EmbedGenerator();
+        this.smartChipManager = new GoogleSmartChipManager(this.app, () => this.uploader);
 
         // Initialize OAuth and uploader if credentials exist
         this.initializeServices();
+
+        // Register Live Preview Smart Chip decoration extension
+        this.registerEditorExtension(createGoogleSmartChipEditorExtension());
+
+        // Automatically convert pasted Google Drive / Docs URLs into Smart Chips
+        this.registerEvent(
+            this.app.workspace.on('editor-paste', (evt: ClipboardEvent, editor: Editor, info) => {
+                if (this.settings.enableSmartChipsOnPaste && info instanceof MarkdownView) {
+                    this.smartChipManager.handleEditorPaste(evt, editor, info);
+                }
+            })
+        );
 
         // Register sidebar file manager view
         this.registerView(
@@ -64,6 +83,21 @@ export default class DriveEmbedderPlugin extends Plugin implements DriveManagerP
             name: 'manage uploaded Drive files',
             callback: () => {
                 void this.activateManagerView();
+            }
+        });
+
+        // Add command: convert raw Google URLs in active note to Smart Chips
+        this.addCommand({
+            id: 'convert-raw-google-links-to-smart-chips',
+            name: 'convert Google Drive/Docs URLs in note to smart chips',
+            editorCallback: (editor: Editor) => {
+                void this.smartChipManager.convertRawUrlsInEditor(editor).then((count) => {
+                    if (count > 0) {
+                        new Notice(`✨ ${count} Google-Link(s) in Smart Chips umgewandelt!`);
+                    } else {
+                        new Notice('Keine rohen Google-Drive/Docs-URLs in dieser Notiz gefunden.');
+                    }
+                });
             }
         });
 
@@ -254,6 +288,8 @@ export default class DriveEmbedderPlugin extends Plugin implements DriveManagerP
     }
 
     private hydrateDriveEmbeds(root: ParentNode) {
+        decorateGoogleSmartChipLinksInDom(root);
+
         if (!this.uploader || !this.isConnected()) {
             return;
         }
@@ -337,6 +373,24 @@ export default class DriveEmbedderPlugin extends Plugin implements DriveManagerP
                     void this.renderPdfWithPdfJs(iframe, fileId, entry);
                 }
             });
+        }
+
+        const pdfViewers: HTMLElement[] = [];
+        if (root instanceof HTMLElement && root.classList.contains('drive-pdf-viewer')) {
+            pdfViewers.push(root);
+        } else if (root.querySelectorAll) {
+            root.querySelectorAll<HTMLElement>('.drive-pdf-viewer').forEach((el) => pdfViewers.push(el));
+        }
+
+        for (const viewerEl of pdfViewers) {
+            const fileId = viewerEl.dataset.driveFileId;
+            if (fileId) {
+                this.attachEmbedHoverButton(viewerEl, fileId);
+            }
+            const maybeViewer = viewerEl as HTMLElement & { __driveEnsureRendered?: () => void };
+            if (typeof maybeViewer.__driveEnsureRendered === 'function') {
+                maybeViewer.__driveEnsureRendered();
+            }
         }
     }
 
@@ -441,55 +495,137 @@ export default class DriveEmbedderPlugin extends Plugin implements DriveManagerP
 
             let currentZoom = 1.0;
             let renderGeneration = 0;
+            let renderedCompleteZoom: number | null = null;
+            let isRendering = false;
 
             const renderAllPages = async (zoom: number) => {
                 const gen = ++renderGeneration;
                 zoomLabel.textContent = `${Math.round(zoom * 100)}%`;
-                pagesContainer.replaceChildren();
 
-                let containerWidth = pagesContainer.clientWidth;
-                if (containerWidth < 100) {
-                    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
-                    containerWidth = pagesContainer.clientWidth;
+                if (!viewerEl.isConnected) {
+                    renderedCompleteZoom = null;
+                    return;
                 }
-                const targetWidth = Math.max(220, (containerWidth || 560) - 28);
-                const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
 
-                for (let pageNum = 1; pageNum <= numPages; pageNum++) {
-                    if (gen !== renderGeneration || !viewerEl.isConnected) {
+                isRendering = true;
+                try {
+                    let containerWidth = pagesContainer.clientWidth;
+                    if (containerWidth < 50) {
+                        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+                        if (gen !== renderGeneration || !viewerEl.isConnected) {
+                            renderedCompleteZoom = null;
+                            return;
+                        }
+                        containerWidth = pagesContainer.clientWidth;
+                    }
+
+                    if (containerWidth < 50) {
+                        renderedCompleteZoom = null;
                         return;
                     }
-                    const page = await pdfDoc.getPage(pageNum);
-                    if (gen !== renderGeneration || !viewerEl.isConnected) {
-                        return;
+
+                    renderedCompleteZoom = null;
+                    pagesContainer.replaceChildren();
+
+                    const targetWidth = Math.max(220, containerWidth - 28);
+                    const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+
+                    for (let pageNum = 1; pageNum <= numPages; pageNum++) {
+                        if (gen !== renderGeneration || !viewerEl.isConnected) {
+                            return;
+                        }
+                        const page = await pdfDoc.getPage(pageNum);
+                        if (gen !== renderGeneration || !viewerEl.isConnected) {
+                            return;
+                        }
+                        const unscaledViewport = page.getViewport({ scale: 1 });
+                        const baseScale = targetWidth / Math.max(1, unscaledViewport.width);
+                        const cssScale = baseScale * zoom;
+                        const hiDpiViewport = page.getViewport({ scale: cssScale * dpr });
+
+                        const pageWrapper = document.createElement('div');
+                        pageWrapper.className = 'drive-pdf-page-wrapper';
+
+                        const canvas = document.createElement('canvas');
+                        canvas.className = 'drive-pdf-page-canvas';
+                        canvas.width = Math.floor(hiDpiViewport.width);
+                        canvas.height = Math.floor(hiDpiViewport.height);
+                        canvas.style.width = `${Math.floor(unscaledViewport.width * cssScale)}px`;
+                        canvas.style.height = `${Math.floor(unscaledViewport.height * cssScale)}px`;
+
+                        pageWrapper.appendChild(canvas);
+                        pagesContainer.appendChild(pageWrapper);
+
+                        const ctx = canvas.getContext('2d');
+                        if (ctx) {
+                            await page.render({
+                                canvasContext: ctx,
+                                viewport: hiDpiViewport
+                            }).promise;
+                        }
                     }
-                    const unscaledViewport = page.getViewport({ scale: 1 });
-                    const baseScale = targetWidth / Math.max(1, unscaledViewport.width);
-                    const cssScale = baseScale * zoom;
-                    const hiDpiViewport = page.getViewport({ scale: cssScale * dpr });
 
-                    const pageWrapper = document.createElement('div');
-                    pageWrapper.className = 'drive-pdf-page-wrapper';
-
-                    const canvas = document.createElement('canvas');
-                    canvas.className = 'drive-pdf-page-canvas';
-                    canvas.width = Math.floor(hiDpiViewport.width);
-                    canvas.height = Math.floor(hiDpiViewport.height);
-                    canvas.style.width = `${Math.floor(unscaledViewport.width * cssScale)}px`;
-                    canvas.style.height = `${Math.floor(unscaledViewport.height * cssScale)}px`;
-
-                    pageWrapper.appendChild(canvas);
-                    pagesContainer.appendChild(pageWrapper);
-
-                    const ctx = canvas.getContext('2d');
-                    if (ctx) {
-                        await page.render({
-                            canvasContext: ctx,
-                            viewport: hiDpiViewport
-                        }).promise;
+                    if (gen === renderGeneration && viewerEl.isConnected) {
+                        renderedCompleteZoom = zoom;
+                    }
+                } finally {
+                    if (gen === renderGeneration) {
+                        isRendering = false;
                     }
                 }
             };
+
+            const ensureRendered = () => {
+                if (!viewerEl.isConnected || isRendering) {
+                    return;
+                }
+                if (
+                    renderedCompleteZoom !== currentZoom ||
+                    pagesContainer.childElementCount < numPages
+                ) {
+                    void renderAllPages(currentZoom);
+                }
+            };
+
+            (viewerEl as HTMLElement & { __driveEnsureRendered?: () => void }).__driveEnsureRendered = ensureRendered;
+
+            if (typeof ResizeObserver !== 'undefined') {
+                let lastWidthBucket = 0;
+                const resizeObserver = new ResizeObserver((entries) => {
+                    for (const entry of entries) {
+                        const width = Math.round(entry.contentRect.width);
+                        if (width >= 50) {
+                            if (
+                                renderedCompleteZoom !== currentZoom ||
+                                pagesContainer.childElementCount < numPages
+                            ) {
+                                ensureRendered();
+                            } else if (lastWidthBucket > 0 && Math.abs(width - lastWidthBucket) > 40) {
+                                lastWidthBucket = width;
+                                void renderAllPages(currentZoom);
+                            }
+                            if (lastWidthBucket === 0) {
+                                lastWidthBucket = width;
+                            }
+                        }
+                    }
+                });
+                resizeObserver.observe(pagesContainer);
+            }
+
+            if (typeof IntersectionObserver !== 'undefined') {
+                const intersectionObserver = new IntersectionObserver(
+                    (entries) => {
+                        for (const entry of entries) {
+                            if (entry.isIntersecting) {
+                                ensureRendered();
+                            }
+                        }
+                    },
+                    { rootMargin: '600px 0px' }
+                );
+                intersectionObserver.observe(viewerEl);
+            }
 
             zoomOutBtn.addEventListener('click', (e) => {
                 e.preventDefault();
@@ -718,26 +854,37 @@ export default class DriveEmbedderPlugin extends Plugin implements DriveManagerP
             this.uploader,
             this.settings.driveFolder,
             this.settings.showTitleByDefault,
-            (result: UploadModalResult) => {
+            (results: UploadModalResult[]) => {
                 void (async () => {
-                    const embedCode = this.embedGenerator.generateEmbed(
-                        result.file.name,
-                        result.uploadResult,
-                        result.embedOptions
+                    if (results.length === 0) {
+                        return;
+                    }
+
+                    const embedBlocks = results.map(result =>
+                        this.embedGenerator.generateEmbed(
+                            result.file.name,
+                            result.uploadResult,
+                            result.embedOptions
+                        ).trim()
                     );
+                    const combinedEmbedCode = embedBlocks.join('\n\n') + '\n';
 
                     const targetEditor = this.getActiveMarkdownEditor(initialEditor);
                     if (targetEditor) {
-                        // Insert at cursor position in the active note
-                        targetEditor.replaceSelection(embedCode);
+                        // Insert all embeds at cursor position in the active note in a single undoable step
+                        targetEditor.replaceSelection(combinedEmbedCode);
                         setTimeout(() => {
                             this.hydrateDriveEmbeds(document.body);
                             this.refreshManagerViews(true, true);
                         }, 100);
-                        new Notice('✅ Link & embed inserted into note!');
+                        new Notice(
+                            results.length === 1
+                                ? '✅ Link & embed inserted into note!'
+                                : `✅ ${results.length} links & embeds inserted into note!`
+                        );
                     } else {
                         // Fallback: copy to clipboard if no Markdown note is open
-                        await navigator.clipboard.writeText(embedCode);
+                        await navigator.clipboard.writeText(combinedEmbedCode);
                         this.refreshManagerViews(true, true);
                         new Notice('📋 embed code copied to clipboard!');
                     }
@@ -794,6 +941,21 @@ class DriveEmbedderSettingTab extends PluginSettingTab {
         }
 
         if (isConnected) {
+            new Setting(connectionDiv)
+                .setName('Reconnect (update permissions)')
+                .setDesc('re-authorize Google Drive (needed once to read titles of private Google Docs/Sheets/Slides for smart chips)')
+                .addButton(button => button
+                    .setButtonText('Reconnect')
+                    .setCta()
+                    .onClick(() => {
+                        void this.plugin.startOAuthFlow().then((success) => {
+                            if (success) {
+                                this.display();
+                            }
+                        });
+                    })
+                );
+
             new Setting(connectionDiv)
                 .setName('Disconnect')
                 .setDesc('disconnect from Google Drive')
@@ -884,6 +1046,17 @@ class DriveEmbedderSettingTab extends PluginSettingTab {
                 .setValue(this.plugin.settings.showTitleByDefault)
                 .onChange((value) => {
                     this.plugin.settings.showTitleByDefault = value;
+                    void this.plugin.saveSettings();
+                })
+            );
+
+        new Setting(containerEl)
+            .setName('Google smart chips on paste')
+            .setDesc('automatically convert pasted Google Drive / Docs / Sheets / Slides / Forms links into named smart chips')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.enableSmartChipsOnPaste)
+                .onChange((value) => {
+                    this.plugin.settings.enableSmartChipsOnPaste = value;
                     void this.plugin.saveSettings();
                 })
             );

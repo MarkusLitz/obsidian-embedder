@@ -111,9 +111,129 @@
 
 .file-details {
     display: flex;
+    flex-wrap: wrap;
     gap: 16px;
     font-size: 0.85em;
     color: var(--text-muted);
+}
+
+/* Multi-file Upload Queue */
+.drive-queue-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 8px;
+    font-size: 0.88em;
+    color: var(--text-muted);
+}
+
+.drive-queue-count {
+    font-weight: 600;
+    color: var(--text-normal);
+}
+
+.drive-queue-clear-btn {
+    padding: 2px 8px;
+    height: 24px;
+    font-size: 0.85em;
+    border-radius: 5px;
+    cursor: pointer;
+    background: var(--background-secondary);
+    color: var(--text-muted);
+    border: 1px solid var(--background-modifier-border);
+}
+
+.drive-queue-clear-btn:hover {
+    color: var(--text-error);
+    border-color: var(--text-error);
+}
+
+.drive-queue-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: 240px;
+    overflow-y: auto;
+    padding-right: 2px;
+}
+
+.drive-queue-item {
+    padding: 10px 12px;
+    transition: border-color 0.15s ease;
+}
+
+.drive-queue-item.status-uploading {
+    border-color: var(--interactive-accent);
+}
+
+.drive-queue-item.status-done {
+    border-color: var(--color-green, #22c55e);
+}
+
+.drive-queue-item.status-error {
+    border-color: var(--text-error, #ef4444);
+}
+
+.drive-queue-row {
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 4px;
+}
+
+.drive-queue-title-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    flex: 1;
+}
+
+.drive-queue-actions-group {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+}
+
+.drive-queue-size-select {
+    font-size: 0.82em;
+    padding: 2px 6px;
+    height: 26px;
+    border-radius: 5px;
+    background: var(--background-primary);
+    color: var(--text-normal);
+    border: 1px solid var(--background-modifier-border);
+    max-width: 155px;
+}
+
+.drive-queue-remove-btn {
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    border-radius: 5px;
+    cursor: pointer;
+    background: transparent;
+    color: var(--text-muted);
+    border: 1px solid transparent;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 12px;
+}
+
+.drive-queue-remove-btn:hover {
+    color: var(--text-error);
+    background: var(--background-modifier-hover);
+    border-color: var(--background-modifier-border);
+}
+
+.drive-queue-status {
+    font-size: 14px;
+}
+
+.drive-queue-error-text {
+    color: var(--text-error);
+    font-weight: 500;
 }
 
 /* Size Options */
@@ -983,3 +1103,119 @@ body.is-mobile .drive-embed-hover-bar {
     border-radius: 4px;
     box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
 }
+
+/* ==========================================================================
+   Google Docs / Drive Smart Chips (Reading View & Live Preview)
+   ========================================================================== */
+
+.google-smart-chip,
+.markdown-rendered a.external-link[href*="docs.google.com"]:not(:has(img)),
+.markdown-rendered a.external-link[href*="drive.google.com"]:not(:has(img)),
+.markdown-rendered a.external-link[href*="forms.gle"]:not(:has(img)) {
+    display: inline-block;
+    padding: 1px 10px 1px 8px;
+    margin: 0 2px;
+    border-radius: 16px;
+    border: 1px solid var(--background-modifier-border);
+    background-color: var(--background-primary-alt);
+    color: var(--text-normal) !important;
+    text-decoration: none !important;
+    font-size: 0.88em;
+    font-weight: 500;
+    line-height: 1.55;
+    vertical-align: baseline;
+    cursor: pointer;
+    transition: background-color 0.15s ease, border-color 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
+    background-image: none !important;
+}
+
+/* Remove Obsidian's external link arrow icon and underlines inside Smart Chips */
+.google-smart-chip::after,
+.markdown-rendered a.external-link[href*="docs.google.com"]::after,
+.markdown-rendered a.external-link[href*="drive.google.com"]::after,
+.markdown-rendered a.external-link[href*="forms.gle"]::after {
+    display: none !important;
+    content: none !important;
+}
+
+.google-smart-chip *,
+.cm-s-obsidian span.cm-link:has(.google-smart-chip),
+.cm-s-obsidian span.cm-link:has(.google-smart-chip) .cm-underline,
+.cm-s-obsidian .google-smart-chip.cm-underline {
+    text-decoration: none !important;
+    color: var(--text-normal) !important;
+}
+
+/* Hover state */
+.google-smart-chip:hover,
+.markdown-rendered a.external-link[href*="docs.google.com"]:not(:has(img)):hover,
+.markdown-rendered a.external-link[href*="drive.google.com"]:not(:has(img)):hover,
+.markdown-rendered a.external-link[href*="forms.gle"]:not(:has(img)):hover {
+    background-color: color-mix(in srgb, var(--interactive-accent) 14%, var(--background-primary-alt));
+    border-color: var(--interactive-accent);
+    color: var(--text-normal) !important;
+    text-decoration: none !important;
+    transform: translateY(-1px);
+    box-shadow: 0 2px 5px rgba(0, 0, 0, 0.12);
+}
+
+/* Base icon pseudo-element (unless the link text already starts with an emoji like 📁 or ⏳) */
+.google-smart-chip:not(.google-chip-has-leading-emoji)::before,
+.markdown-rendered a.external-link[href*="docs.google.com"]:not(:has(img)):not(.google-chip-has-leading-emoji)::before,
+.markdown-rendered a.external-link[href*="drive.google.com"]:not(:has(img)):not(.google-chip-has-leading-emoji)::before,
+.markdown-rendered a.external-link[href*="forms.gle"]:not(:has(img)):not(.google-chip-has-leading-emoji)::before {
+    content: "";
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    margin-right: 6px;
+    vertical-align: -2.5px;
+    background-size: contain;
+    background-repeat: no-repeat;
+    background-position: center;
+    /* Default: Google Drive multicolor triangle icon */
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%230F9D58' d='M8.5 3.5L2 14.8l3.5 6 6.5-11.3z'/%3E%3Cpath fill='%23F4B400' d='M15.5 3.5h-7l6.5 11.3h7z'/%3E%3Cpath fill='%234285F4' d='M5.5 20.8h13l3.5-6H9z'/%3E%3C/svg%3E");
+}
+
+/* Google Docs (Blue) */
+.google-smart-chip.google-chip-docs:not(.google-chip-has-leading-emoji)::before,
+.markdown-rendered a.external-link[href*="docs.google.com/document"]:not(:has(img)):not(.google-chip-has-leading-emoji)::before {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%234285F4' d='M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6z'/%3E%3Cpath fill='%23A1C2FA' d='M14 2v6h6l-6-6z'/%3E%3Cpath fill='%23FFFFFF' d='M8 13h8v1.5H8V13zm0 3h8v1.5H8V16zm0-6h5v1.5H8V10z'/%3E%3C/svg%3E");
+}
+
+/* Google Sheets (Green) */
+.google-smart-chip.google-chip-sheets:not(.google-chip-has-leading-emoji)::before,
+.markdown-rendered a.external-link[href*="docs.google.com/spreadsheets"]:not(:has(img)):not(.google-chip-has-leading-emoji)::before {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%230F9D58' d='M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6z'/%3E%3Cpath fill='%2387CEAC' d='M14 2v6h6l-6-6z'/%3E%3Cpath fill='%23FFFFFF' d='M7.5 11h9v7h-9v-7zm1.5 1.5v1.5h2.5v-1.5H9zm4 0v1.5h2.5v-1.5H13zm-4 3v1.5h2.5v-1.5H9zm4 0v1.5h2.5v-1.5H13z'/%3E%3C/svg%3E");
+}
+
+/* Google Slides (Yellow) */
+.google-smart-chip.google-chip-slides:not(.google-chip-has-leading-emoji)::before,
+.markdown-rendered a.external-link[href*="docs.google.com/presentation"]:not(:has(img)):not(.google-chip-has-leading-emoji)::before {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%23F4B400' d='M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6z'/%3E%3Cpath fill='%23F9D97F' d='M14 2v6h6l-6-6z'/%3E%3Cpath fill='%23FFFFFF' d='M7.5 11.5h9v6h-9v-6zm1.5 1.5v3h6v-3H9z'/%3E%3C/svg%3E");
+}
+
+/* Google Forms (Purple) */
+.google-smart-chip.google-chip-forms:not(.google-chip-has-leading-emoji)::before,
+.markdown-rendered a.external-link[href*="docs.google.com/forms"]:not(:has(img)):not(.google-chip-has-leading-emoji)::before,
+.markdown-rendered a.external-link[href*="forms.gle"]:not(:has(img)):not(.google-chip-has-leading-emoji)::before {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%23673AB7' d='M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6z'/%3E%3Cpath fill='%23B39DDB' d='M14 2v6h6l-6-6z'/%3E%3Ccircle fill='%23FFFFFF' cx='8.8' cy='11.2' r='1'/%3E%3Ccircle fill='%23FFFFFF' cx='8.8' cy='14.2' r='1'/%3E%3Ccircle fill='%23FFFFFF' cx='8.8' cy='17.2' r='1'/%3E%3Cpath fill='%23FFFFFF' d='M11 10.5h5v1.5h-5v-1.5zm0 3h5v1.5h-5v-1.5zm0 3h5v1.5h-5v-1.5z'/%3E%3C/svg%3E");
+}
+
+/* Google Drawings (Red) */
+.google-smart-chip.google-chip-drawings:not(.google-chip-has-leading-emoji)::before,
+.markdown-rendered a.external-link[href*="docs.google.com/drawings"]:not(:has(img)):not(.google-chip-has-leading-emoji)::before {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%23DB4437' d='M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6z'/%3E%3Cpath fill='%23F4A7A1' d='M14 2v6h6l-6-6z'/%3E%3Ccircle fill='%23FFFFFF' cx='10' cy='13' r='3'/%3E%3Cpath fill='%23FFFFFF' opacity='0.85' d='M11.5 13.5h5v4.5h-5z'/%3E%3C/svg%3E");
+}
+
+/* Google Drive Folder */
+.google-smart-chip.google-chip-folder:not(.google-chip-has-leading-emoji)::before,
+.markdown-rendered a.external-link[href*="drive.google.com"][href*="/folders/"]:not(:has(img)):not(.google-chip-has-leading-emoji)::before {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%235F6368' d='M10 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-8l-2-2z'/%3E%3C/svg%3E");
+}
+
+/* Google Drive PDF */
+.google-smart-chip.google-chip-pdf:not(.google-chip-has-leading-emoji)::before {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%23EA4335' d='M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6z'/%3E%3Cpath fill='%23F6AEA9' d='M14 2v6h6l-6-6z'/%3E%3Cpath fill='%23FFFFFF' d='M8 12h8v1.5H8V12zm0 3h5v1.5H8V15z'/%3E%3C/svg%3E");
+}
+

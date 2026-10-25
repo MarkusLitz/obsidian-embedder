@@ -355,7 +355,7 @@ export class GoogleDriveUploader {
         try {
             const accessToken = await this.ensureValidToken();
             const response = await requestUrl({
-                url: `${this.API_URL}/files/${encodeURIComponent(fileId)}?fields=id,name,mimeType,size,createdTime,modifiedTime,webViewLink,trashed`,
+                url: `${this.API_URL}/files/${encodeURIComponent(fileId)}?fields=id,name,mimeType,size,createdTime,modifiedTime,webViewLink,trashed&supportsAllDrives=true`,
                 method: 'GET',
                 headers: {
                     'Authorization': `Bearer ${accessToken}`

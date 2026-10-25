@@ -70,6 +70,7 @@ export interface DriveEmbedderSettings {
 
     // Embed settings
     showTitleByDefault: boolean;
+    enableSmartChipsOnPaste: boolean;
     defaultTheme: 'light' | 'dark' | 'auto';
 
     // Default sizes per category

@@ -1,11 +1,11 @@
 /**
  * Drive Embedder - Upload Modal
- * File picker and size selector UI
+ * Multi-file picker, queue list, per-file & global size selector UI
  */
 
 import { Modal, App, Notice, Setting } from 'obsidian';
 import { ContentCategory, SizeOption, UploadProgress, DriveUploadResult, EmbedOptions } from './types';
-import { getFileTypeInfo, getSizePresets, getRecommendedSize, isFileSupported, SUPPORTED_EXTENSIONS } from './size-presets';
+import { getFileTypeInfo, getSizePresets, getRecommendedSize, SUPPORTED_EXTENSIONS } from './size-presets';
 import { GoogleDriveUploader } from './uploader';
 
 export interface UploadModalResult {
@@ -14,15 +14,25 @@ export interface UploadModalResult {
     embedOptions: EmbedOptions;
 }
 
+interface QueuedUploadItem {
+    id: string;
+    file: File;
+    category: ContentCategory;
+    icon: string;
+    label: string;
+    selectedSize: SizeOption;
+    status: 'pending' | 'uploading' | 'done' | 'error';
+    errorMessage?: string;
+}
+
 export class UploadModal extends Modal {
     private uploader: GoogleDriveUploader;
     private driveFolder: string;
-    private onComplete: (result: UploadModalResult) => void;
+    private onComplete: (results: UploadModalResult[]) => void;
 
-    private selectedFile: File | null = null;
-    private selectedSize: SizeOption | null = null;
-    private fileCategory: ContentCategory | null = null;
+    private queuedItems: QueuedUploadItem[] = [];
     private showTitle: boolean = true;
+    private isUploading: boolean = false;
 
     // UI Elements
     private fileInputEl: HTMLInputElement | null = null;
@@ -41,7 +51,7 @@ export class UploadModal extends Modal {
         uploader: GoogleDriveUploader,
         driveFolder: string,
         defaultShowTitle: boolean,
-        onComplete: (result: UploadModalResult) => void
+        onComplete: (results: UploadModalResult[]) => void
     ) {
         super(app);
         this.uploader = uploader;
@@ -57,19 +67,19 @@ export class UploadModal extends Modal {
 
         // Modal Header
         contentEl.createEl('h2', {
-            text: '📁 upload file',
+            text: '📁 upload files',
             cls: 'drive-embedder-title'
         });
 
         contentEl.createEl('p', {
-            text: 'upload files to Google Drive and generate embed code.',
+            text: 'upload one or multiple files to Google Drive and insert embeds.',
             cls: 'drive-embedder-subtitle'
         });
 
         // File Selection Section
         this.createFileSection(contentEl);
 
-        // File Info Display (hidden initially)
+        // File Queue Info Display (hidden initially)
         this.fileInfoEl = contentEl.createDiv({ cls: 'drive-embedder-file-info hidden' });
 
         // Size Options Section (hidden initially)
@@ -91,11 +101,12 @@ export class UploadModal extends Modal {
     private createFileSection(container: HTMLElement) {
         const section = container.createDiv({ cls: 'drive-embedder-section' });
 
-        // Hidden file input
+        // Hidden file input with multiple enabled
         this.fileInputEl = section.createEl('input', {
             type: 'file',
             cls: 'drive-embedder-file-input'
         });
+        this.fileInputEl.multiple = true;
         this.fileInputEl.accept = SUPPORTED_EXTENSIONS.join(',');
         this.fileInputEl.addEventListener('change', (e) => this.handleFileSelect(e));
 
@@ -104,15 +115,21 @@ export class UploadModal extends Modal {
         const dropzoneContent = dropZone.createDiv({ cls: 'dropzone-content' });
         dropzoneContent.createSpan({ cls: 'dropzone-icon', text: '📂' });
         dropzoneContent.createEl('p', { cls: 'dropzone-text', text: 'drag files here or' });
-        const selectBtn = dropzoneContent.createEl('button', { cls: 'dropzone-btn', text: 'select file' });
+        const selectBtn = dropzoneContent.createEl('button', { cls: 'dropzone-btn', text: 'select files' });
 
         // Click to select
-        selectBtn.addEventListener('click', () => this.fileInputEl?.click());
+        selectBtn.addEventListener('click', () => {
+            if (!this.isUploading) {
+                this.fileInputEl?.click();
+            }
+        });
 
         // Drag and drop handlers
         dropZone.addEventListener('dragover', (e) => {
             e.preventDefault();
-            dropZone.addClass('dragover');
+            if (!this.isUploading) {
+                dropZone.addClass('dragover');
+            }
         });
 
         dropZone.addEventListener('dragleave', () => {
@@ -122,109 +139,294 @@ export class UploadModal extends Modal {
         dropZone.addEventListener('drop', (e) => {
             e.preventDefault();
             dropZone.removeClass('dragover');
+            if (this.isUploading) return;
             const files = e.dataTransfer?.files;
             if (files && files.length > 0) {
-                this.processFile(files[0]);
+                this.processFiles(Array.from(files));
             }
         });
     }
 
     private handleFileSelect(e: Event) {
         const input = e.target as HTMLInputElement;
-        const file = input.files?.[0];
-        if (file) {
-            this.processFile(file);
+        const files = input.files;
+        if (files && files.length > 0) {
+            this.processFiles(Array.from(files));
+            // Reset input so selecting the same or more files triggers change again
+            input.value = '';
         }
     }
 
-    private processFile(file: File) {
-        // Check if file type is supported
-        const fileInfo = getFileTypeInfo(file.name, file.type);
-        if (!fileInfo) {
-            new Notice('unsupported file type.');
-            return;
+    private processFiles(files: File[]) {
+        let addedCount = 0;
+
+        for (const file of files) {
+            const fileInfo = getFileTypeInfo(file.name, file.type);
+            if (!fileInfo) {
+                new Notice(`unsupported file type: ${file.name}`);
+                continue;
+            }
+
+            // Avoid adding exact duplicate in the current queue
+            const fileKey = `${file.name}::${file.size}::${file.lastModified}`;
+            if (this.queuedItems.some(item => item.id === fileKey)) {
+                continue;
+            }
+
+            this.queuedItems.push({
+                id: fileKey,
+                file,
+                category: fileInfo.category,
+                icon: fileInfo.icon,
+                label: fileInfo.label,
+                selectedSize: getRecommendedSize(fileInfo.category),
+                status: 'pending'
+            });
+            addedCount++;
         }
 
-        this.selectedFile = file;
-        this.fileCategory = fileInfo.category;
-
-        // Update file info display
-        this.updateFileInfo(file, fileInfo);
-
-        // Show size options
-        this.updateSizeOptions(fileInfo.category);
-
-        // Enable upload button
-        if (this.uploadBtn) {
-            this.uploadBtn.disabled = false;
+        if (addedCount > 0 || this.queuedItems.length > 0) {
+            this.refreshQueueAndSizeUI();
         }
     }
 
-    private updateFileInfo(file: File, fileInfo: { category: ContentCategory; icon: string; label: string }) {
+    private removeQueuedItem(id: string) {
+        if (this.isUploading) return;
+        this.queuedItems = this.queuedItems.filter(item => item.id !== id);
+        this.refreshQueueAndSizeUI();
+    }
+
+    private clearAllQueuedItems() {
+        if (this.isUploading) return;
+        this.queuedItems = [];
+        this.refreshQueueAndSizeUI();
+    }
+
+    private refreshQueueAndSizeUI() {
+        this.updateFileInfo();
+        this.updateSizeOptions();
+        this.updateUploadButtonState();
+    }
+
+    private updateUploadButtonState() {
+        if (!this.uploadBtn) return;
+        const count = this.queuedItems.length;
+        if (count === 0) {
+            this.uploadBtn.disabled = true;
+            this.uploadBtn.textContent = '📤 upload and embed';
+        } else if (count === 1) {
+            this.uploadBtn.disabled = this.isUploading;
+            this.uploadBtn.textContent = this.isUploading ? 'Uploading...' : '📤 upload and embed';
+        } else {
+            this.uploadBtn.disabled = this.isUploading;
+            this.uploadBtn.textContent = this.isUploading
+                ? 'Uploading...'
+                : `📤 upload and embed (${count} files)`;
+        }
+    }
+
+    private updateFileInfo() {
         if (!this.fileInfoEl) return;
 
         this.fileInfoEl.empty();
+
+        if (this.queuedItems.length === 0) {
+            this.fileInfoEl.addClass('hidden');
+            return;
+        }
+
         this.fileInfoEl.removeClass('hidden');
 
-        const infoCard = this.fileInfoEl.createDiv({ cls: 'file-info-card' });
+        // Summary header when multiple files are queued
+        if (this.queuedItems.length > 1) {
+            const totalBytes = this.queuedItems.reduce((sum, item) => sum + item.file.size, 0);
+            const queueHeader = this.fileInfoEl.createDiv({ cls: 'drive-queue-header' });
+            queueHeader.createSpan({
+                cls: 'drive-queue-count',
+                text: `${this.queuedItems.length} files selected (${this.formatFileSize(totalBytes)})`
+            });
 
-        // File icon and name
-        const fileHeader = infoCard.createDiv({ cls: 'file-header' });
-        fileHeader.createSpan({ text: fileInfo.icon, cls: 'file-icon' });
-        fileHeader.createSpan({ text: file.name, cls: 'file-name' });
+            if (!this.isUploading) {
+                const clearBtn = queueHeader.createEl('button', {
+                    type: 'button',
+                    cls: 'drive-queue-clear-btn',
+                    text: 'Clear all'
+                });
+                clearBtn.addEventListener('click', () => this.clearAllQueuedItems());
+            }
+        }
 
-        // File details
-        const fileDetails = infoCard.createDiv({ cls: 'file-details' });
-        fileDetails.createSpan({ text: `Type: ${fileInfo.label}`, cls: 'file-type' });
-        fileDetails.createSpan({ text: `Size: ${this.formatFileSize(file.size)}`, cls: 'file-size' });
+        const listEl = this.fileInfoEl.createDiv({ cls: 'drive-queue-list' });
+
+        for (const item of this.queuedItems) {
+            const infoCard = listEl.createDiv({
+                cls: `file-info-card drive-queue-item status-${item.status}`
+            });
+
+            // Top row: icon, filename, size dropdown, status/remove button
+            const fileHeader = infoCard.createDiv({ cls: 'file-header drive-queue-row' });
+
+            const titleGroup = fileHeader.createDiv({ cls: 'drive-queue-title-group' });
+            titleGroup.createSpan({ text: item.icon, cls: 'file-icon' });
+            titleGroup.createSpan({ text: item.file.name, cls: 'file-name' });
+
+            const actionsGroup = fileHeader.createDiv({ cls: 'drive-queue-actions-group' });
+
+            // Per-file size preset dropdown
+            const presets = getSizePresets(item.category);
+            const sizeSelect = actionsGroup.createEl('select', {
+                cls: 'drive-queue-size-select',
+                attr: { 'aria-label': `Embed size for ${item.file.name}` }
+            });
+            sizeSelect.disabled = this.isUploading;
+
+            for (const preset of presets) {
+                const opt = sizeSelect.createEl('option', {
+                    value: preset.id,
+                    text: `${preset.icon} ${preset.label} (${preset.width})`
+                });
+                if (preset.id === item.selectedSize.id) {
+                    opt.selected = true;
+                }
+            }
+
+            sizeSelect.addEventListener('change', () => {
+                const chosen = presets.find(p => p.id === sizeSelect.value);
+                if (chosen) {
+                    item.selectedSize = chosen;
+                    this.updateSizeOptions();
+                }
+            });
+
+            // Status indicator or remove button
+            if (item.status === 'uploading') {
+                actionsGroup.createSpan({ cls: 'drive-queue-status', text: '⏳' });
+            } else if (item.status === 'done') {
+                actionsGroup.createSpan({ cls: 'drive-queue-status', text: '✅' });
+            } else if (item.status === 'error') {
+                actionsGroup.createSpan({
+                    cls: 'drive-queue-status',
+                    text: '❌',
+                    attr: { title: item.errorMessage || 'Upload failed' }
+                });
+            }
+
+            if (!this.isUploading) {
+                const removeBtn = actionsGroup.createEl('button', {
+                    type: 'button',
+                    cls: 'drive-queue-remove-btn',
+                    text: '✕',
+                    attr: { title: 'Remove file from queue' }
+                });
+                removeBtn.addEventListener('click', () => this.removeQueuedItem(item.id));
+            }
+
+            // Bottom row: file details
+            const fileDetails = infoCard.createDiv({ cls: 'file-details' });
+            fileDetails.createSpan({ text: `Type: ${item.label}`, cls: 'file-type' });
+            fileDetails.createSpan({ text: `Size: ${this.formatFileSize(item.file.size)}`, cls: 'file-size' });
+            if (item.status === 'error' && item.errorMessage) {
+                fileDetails.createSpan({ text: `Error: ${item.errorMessage}`, cls: 'drive-queue-error-text' });
+            }
+        }
     }
 
-    private updateSizeOptions(category: ContentCategory) {
+    private updateSizeOptions() {
         if (!this.sizeOptionsEl) return;
 
         this.sizeOptionsEl.empty();
+
+        if (this.queuedItems.length === 0) {
+            this.sizeOptionsEl.addClass('hidden');
+            return;
+        }
+
         this.sizeOptionsEl.removeClass('hidden');
 
-        const presets = getSizePresets(category);
-        const recommended = getRecommendedSize(category);
+        const uniqueCategories = Array.from(new Set(this.queuedItems.map(item => item.category)));
 
-        // Section title
-        this.sizeOptionsEl.createEl('h4', {
-            text: '📐 select embed size',
-            cls: 'size-section-title'
-        });
+        if (uniqueCategories.length === 1) {
+            // All files share the same category -> show that category's exact presets
+            const category = uniqueCategories[0];
+            const presets = getSizePresets(category);
+            const recommended = getRecommendedSize(category);
 
-        // Size options grid
-        const optionsGrid = this.sizeOptionsEl.createDiv({ cls: 'size-options-grid' });
+            // Check if all queued items currently share the same preset id
+            const commonSizeId = this.queuedItems.every(i => i.selectedSize.id === this.queuedItems[0].selectedSize.id)
+                ? this.queuedItems[0].selectedSize.id
+                : null;
 
-        presets.forEach((preset) => {
-            const option = optionsGrid.createDiv({
-                cls: `size-option ${preset.id === recommended?.id ? 'recommended' : ''}`
+            this.sizeOptionsEl.createEl('h4', {
+                text: this.queuedItems.length > 1 ? '📐 select embed size (applies to all)' : '📐 select embed size',
+                cls: 'size-section-title'
             });
 
-            option.createSpan({ cls: 'size-icon', text: preset.icon });
-            option.createSpan({ cls: 'size-label', text: preset.label });
-            option.createSpan({ cls: 'size-desc', text: preset.description });
-            if (preset.recommended) {
-                option.createSpan({ cls: 'recommended-badge', text: 'recommended' });
-            }
+            const optionsGrid = this.sizeOptionsEl.createDiv({ cls: 'size-options-grid' });
 
-            // Select default (recommended)
-            if (preset.id === recommended?.id) {
-                option.addClass('selected');
-                this.selectedSize = preset;
-            }
+            presets.forEach((preset) => {
+                const option = optionsGrid.createDiv({
+                    cls: `size-option ${preset.id === recommended?.id ? 'recommended' : ''} ${preset.id === commonSizeId ? 'selected' : ''}`
+                });
 
-            option.addEventListener('click', () => {
-                // Remove selection from all
-                optionsGrid.querySelectorAll('.size-option').forEach(el =>
-                    el.removeClass('selected')
-                );
-                // Select this one
-                option.addClass('selected');
-                this.selectedSize = preset;
+                option.createSpan({ cls: 'size-icon', text: preset.icon });
+                option.createSpan({ cls: 'size-label', text: preset.label });
+                option.createSpan({ cls: 'size-desc', text: preset.description });
+                if (preset.recommended) {
+                    option.createSpan({ cls: 'recommended-badge', text: 'recommended' });
+                }
+
+                option.addEventListener('click', () => {
+                    if (this.isUploading) return;
+                    for (const item of this.queuedItems) {
+                        item.selectedSize = preset;
+                    }
+                    this.updateFileInfo();
+                    this.updateSizeOptions();
+                });
             });
-        });
+        } else {
+            // Mixed categories -> show global quick-preset buttons that map to each file's category
+            this.sizeOptionsEl.createEl('h4', {
+                text: '📐 apply size to all files (or adjust per file above)',
+                cls: 'size-section-title'
+            });
+
+            const optionsGrid = this.sizeOptionsEl.createDiv({ cls: 'size-options-grid' });
+            const globalTiers: Array<{ id: 'compact' | 'recommended' | 'large' | 'max'; icon: string; label: string; desc: string; recommended?: boolean }> = [
+                { id: 'compact', icon: '🔹', label: 'Compact', desc: 'smaller inline preview' },
+                { id: 'recommended', icon: '🔸', label: 'Recommended', desc: 'default size per file type', recommended: true },
+                { id: 'large', icon: '🔶', label: 'Large', desc: 'larger viewing size' },
+                { id: 'max', icon: '🟠', label: 'Full / Max', desc: 'maximum width & height' }
+            ];
+
+            for (const tier of globalTiers) {
+                const option = optionsGrid.createDiv({
+                    cls: `size-option ${tier.recommended ? 'recommended' : ''}`
+                });
+                option.createSpan({ cls: 'size-icon', text: tier.icon });
+                option.createSpan({ cls: 'size-label', text: tier.label });
+                option.createSpan({ cls: 'size-desc', text: tier.desc });
+
+                option.addEventListener('click', () => {
+                    if (this.isUploading) return;
+                    for (const item of this.queuedItems) {
+                        const catPresets = getSizePresets(item.category);
+                        if (tier.id === 'recommended') {
+                            item.selectedSize = getRecommendedSize(item.category);
+                        } else if (tier.id === 'compact') {
+                            item.selectedSize = catPresets.find(p => p.id === 'compact') || catPresets[0];
+                        } else if (tier.id === 'large') {
+                            item.selectedSize = catPresets.find(p => p.id === 'large') || catPresets[catPresets.length - 1];
+                        } else {
+                            item.selectedSize = catPresets[catPresets.length - 1];
+                        }
+                    }
+                    this.updateFileInfo();
+                    optionsGrid.querySelectorAll('.size-option').forEach(el => el.removeClass('selected'));
+                    option.addClass('selected');
+                });
+            }
+        }
     }
 
     private createTitleToggle(container: HTMLElement) {
@@ -283,59 +485,95 @@ export class UploadModal extends Modal {
     }
 
     private async handleUpload() {
-        const file = this.selectedFile;
-        const size = this.selectedSize;
-
-        if (!file || !size) {
-            new Notice('please select a file and size.');
+        if (this.queuedItems.length === 0 || this.isUploading) {
+            new Notice('please select at least one file.');
             return;
         }
 
-        // Disable upload button
-        if (this.uploadBtn) {
-            this.uploadBtn.disabled = true;
-            this.uploadBtn.textContent = 'Uploading...';
-        }
-
-        // Show progress
+        this.isUploading = true;
+        this.updateUploadButtonState();
+        this.updateFileInfo();
         this.showProgress();
 
-        try {
-            const result = await this.uploader.uploadFile(
-                file,
-                this.driveFolder,
-                (progress) => this.updateProgress(progress)
-            );
+        const completedResults: UploadModalResult[] = [];
+        const totalFiles = this.queuedItems.length;
+        let finishedCount = 0;
 
-            if (!result) {
-                throw new Error('Failed to receive upload result.');
-            }
+        for (let i = 0; i < this.queuedItems.length; i++) {
+            const item = this.queuedItems[i];
+            item.status = 'uploading';
+            item.errorMessage = undefined;
+            this.updateFileInfo();
 
-            // Success!
-            new Notice('✅ upload complete! embed code generated.');
+            const prefix = totalFiles > 1 ? `[${i + 1}/${totalFiles}] ${item.file.name}: ` : '';
 
-            this.onComplete({
-                file: file,
-                uploadResult: result,
-                embedOptions: {
-                    size: size,
-                    showTitle: this.showTitle
+            try {
+                const result = await this.uploader.uploadFile(
+                    item.file,
+                    this.driveFolder,
+                    (progress) => {
+                        const overallProgress = ((finishedCount * 100) + progress.progress) / totalFiles;
+                        this.updateProgress({
+                            stage: progress.stage,
+                            message: `${prefix}${progress.message}`,
+                            progress: overallProgress
+                        });
+                    }
+                );
+
+                if (!result) {
+                    throw new Error('Failed to receive upload result.');
                 }
-            });
 
-            this.close();
-        } catch (error) {
-            console.error('Upload failed:', error);
-            const message = error instanceof Error ? error.message : String(error);
-            new Notice(`❌ upload failed: ${message}`);
-
-            // Re-enable upload button
-            if (this.uploadBtn) {
-                this.uploadBtn.disabled = false;
-                this.uploadBtn.textContent = '📤 upload and embed';
+                item.status = 'done';
+                finishedCount++;
+                completedResults.push({
+                    file: item.file,
+                    uploadResult: result,
+                    embedOptions: {
+                        size: item.selectedSize,
+                        showTitle: this.showTitle
+                    }
+                });
+                this.updateFileInfo();
+            } catch (error) {
+                console.error(`Upload failed for ${item.file.name}:`, error);
+                const message = error instanceof Error ? error.message : String(error);
+                item.status = 'error';
+                item.errorMessage = message;
+                finishedCount++;
+                this.updateFileInfo();
             }
+        }
 
+        this.isUploading = false;
+
+        // Immediately pass any completed uploads to the note
+        if (completedResults.length > 0) {
+            this.onComplete(completedResults);
+        }
+
+        const failedItems = this.queuedItems.filter(item => item.status === 'error');
+        if (failedItems.length === 0) {
+            new Notice(
+                completedResults.length === 1
+                    ? '✅ upload complete! embed code generated.'
+                    : `✅ ${completedResults.length} files uploaded and embedded!`
+            );
+            this.close();
+        } else {
+            // Keep only failed items in the modal so retry won't re-upload already inserted files
+            this.queuedItems = failedItems;
             this.hideProgress();
+            this.refreshQueueAndSizeUI();
+            if (this.uploadBtn) {
+                this.uploadBtn.textContent = `🔄 retry failed (${failedItems.length})`;
+            }
+            new Notice(
+                completedResults.length > 0
+                    ? `⚠️ ${completedResults.length} uploaded, ${failedItems.length} failed. You can retry the failed files.`
+                    : `❌ upload failed for ${failedItems.length} file(s).`
+            );
         }
     }
 
