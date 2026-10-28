@@ -219,6 +219,7 @@ export default class DriveEmbedderPlugin extends Plugin implements DriveManagerP
                     accessToken: this.settings.googleAccessToken,
                     refreshToken: this.settings.googleRefreshToken,
                     tokenExpiresAt: this.settings.tokenExpiresAt,
+                    driveFolder: this.settings.driveFolder,
                     onTokenRefresh: async (tokens) => {
                         this.settings.googleAccessToken = tokens.accessToken;
                         this.settings.googleRefreshToken = tokens.refreshToken;

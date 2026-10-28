@@ -682,12 +682,19 @@ Content-Transfer-Encoding: base64\r
     }
   }
   /**
-   * List all non-trashed files uploaded by this plugin to Google Drive
+   * List all non-trashed files uploaded by this plugin inside the configured Drive folder
    */
-  async listUploadedFiles() {
+  async listUploadedFiles(folderPath) {
+    var _a;
     try {
       const accessToken = await this.ensureValidToken();
-      const query = "mimeType!='application/vnd.google-apps.folder' and trashed=false";
+      const targetFolder = ((_a = folderPath != null ? folderPath : this.config.driveFolder) != null ? _a : "Obsidian/DriveEmbedder").trim();
+      const folderId = await this.resolveFolderId(targetFolder);
+      if (!folderId) {
+        return [];
+      }
+      const safeFolderId = folderId.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+      const query = `'${safeFolderId}' in parents and mimeType!='application/vnd.google-apps.folder' and trashed=false`;
       const fields = "nextPageToken,files(id,name,mimeType,size,createdTime,modifiedTime,webViewLink,trashed)";
       const results = [];
       let pageToken = "";
@@ -807,10 +814,25 @@ Content-Transfer-Encoding: base64\r
     }
   }
   /**
+   * Resolve an existing folder path on Google Drive without creating missing folders
+   */
+  async resolveFolderId(folderPath) {
+    const parts = folderPath.split("/").map((p) => p.trim()).filter((p) => p.length > 0);
+    let parentId = "root";
+    for (const folderName of parts) {
+      const existingId = await this.findFolder(folderName, parentId);
+      if (!existingId) {
+        return null;
+      }
+      parentId = existingId;
+    }
+    return parentId;
+  }
+  /**
    * Ensure folder exists, creating if necessary
    */
   async ensureFolder(folderPath) {
-    const parts = folderPath.split("/").filter((p) => p.length > 0);
+    const parts = folderPath.split("/").map((p) => p.trim()).filter((p) => p.length > 0);
     let parentId = "root";
     for (const folderName of parts) {
       const existingId = await this.findFolder(folderName, parentId);
@@ -1794,13 +1816,17 @@ function scanNoteContent(content, notePath, noteName) {
     let fileName = "";
     let showTitle = false;
     const beforeSlice = content.slice(Math.max(0, divStart - 600), divStart);
-    const titleRegex = /(?:^|\r?\n)([ \t]*(?:\*\*\[📁\s*([^\n]+?)\]\([^)\r\n]+\)\*\*|\[📁\s*([^\n]+?)\]\([^)\r\n]+\)|\*\*📁\s*([^\n*]+?)\*\*)[ \t]*\r?\n(?:\r?\n)?)$/;
+    const titleRegex = /(?:^|\r?\n|>)([ \t]*(?:\*\*\[📁\s*([^\n]+?)\]\(([^)\r\n]+)\)\*\*|\[📁\s*([^\n]+?)\]\(([^)\r\n]+)\)|\*\*📁\s*([^\n*]+?)\*\*)[ \t]*\r?\n(?:\r?\n)?)$/;
     const titleMatch = beforeSlice.match(titleRegex);
     if (titleMatch && titleMatch[1]) {
-      charStart = divStart - titleMatch[1].length;
-      const rawName = titleMatch[2] || titleMatch[3] || titleMatch[4] || "";
-      fileName = unescapeMarkdownTitle(rawName);
-      showTitle = Boolean(titleMatch[2] || titleMatch[4]);
+      const titleUrl = titleMatch[3] || titleMatch[5] || "";
+      const titleFileId = titleUrl ? extractDriveIdFromText(titleUrl) : null;
+      if (!titleFileId || titleFileId === fileId) {
+        charStart = divStart - titleMatch[1].length;
+        const rawName = titleMatch[2] || titleMatch[4] || titleMatch[6] || "";
+        fileName = unescapeMarkdownTitle(rawName);
+        showTitle = Boolean(titleMatch[2] || titleMatch[6]);
+      }
     }
     if (!fileName) {
       const altMatch = divHtml.match(/\balt="([^"]*)"/i);
@@ -1875,9 +1901,9 @@ function scanNoteContent(content, notePath, noteName) {
       showTitle
     });
   }
-  const standaloneLinkRegex = /^[ \t]*(?:\*\*\[📁\s*([^\n]+?)\]\((https:\/\/drive\.google\.com\/[^)\r\n]+)\)\*\*|\[📁\s*([^\n]+?)\]\((https:\/\/drive\.google\.com\/[^)\r\n]+)\))[ \t]*$/gm;
+  const markdownLinkRegex = /\*\*\[([^\n\]]+?)\]\((https:\/\/drive\.google\.com\/[^)\s]+)\)\*\*|\[([^\n\]]+?)\]\((https:\/\/drive\.google\.com\/[^)\s]+)\)/g;
   let linkMatch;
-  while ((linkMatch = standaloneLinkRegex.exec(content)) !== null) {
+  while ((linkMatch = markdownLinkRegex.exec(content)) !== null) {
     const matchStart = linkMatch.index;
     const matchEnd = matchStart + linkMatch[0].length;
     const alreadyCovered = occurrences.some(
@@ -1886,7 +1912,7 @@ function scanNoteContent(content, notePath, noteName) {
     if (alreadyCovered) {
       continue;
     }
-    const rawName = linkMatch[1] || linkMatch[3] || "";
+    const rawName = (linkMatch[1] || linkMatch[3] || "").replace(/^(?:📁|📄|📊|📽️|🖼️|🎬|🎵|🗃️)\s*/u, "");
     const rawUrl = linkMatch[2] || linkMatch[4] || "";
     const fileId = extractDriveIdFromText(rawUrl);
     if (!fileId) {
@@ -3526,6 +3552,7 @@ var DriveEmbedderPlugin = class extends import_obsidian6.Plugin {
           accessToken: this.settings.googleAccessToken,
           refreshToken: this.settings.googleRefreshToken,
           tokenExpiresAt: this.settings.tokenExpiresAt,
+          driveFolder: this.settings.driveFolder,
           onTokenRefresh: async (tokens) => {
             this.settings.googleAccessToken = tokens.accessToken;
             this.settings.googleRefreshToken = tokens.refreshToken;

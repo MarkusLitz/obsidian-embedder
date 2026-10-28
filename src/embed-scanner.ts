@@ -82,14 +82,18 @@ export function scanNoteContent(
 
         // Check immediately preceding lines for the associated [📁 filename](...) or **📁 filename** title
         const beforeSlice = content.slice(Math.max(0, divStart - 600), divStart);
-        const titleRegex = /(?:^|\r?\n)([ \t]*(?:\*\*\[📁\s*([^\n]+?)\]\([^)\r\n]+\)\*\*|\[📁\s*([^\n]+?)\]\([^)\r\n]+\)|\*\*📁\s*([^\n*]+?)\*\*)[ \t]*\r?\n(?:\r?\n)?)$/;
+        const titleRegex = /(?:^|\r?\n|>)([ \t]*(?:\*\*\[📁\s*([^\n]+?)\]\(([^)\r\n]+)\)\*\*|\[📁\s*([^\n]+?)\]\(([^)\r\n]+)\)|\*\*📁\s*([^\n*]+?)\*\*)[ \t]*\r?\n(?:\r?\n)?)$/;
         const titleMatch = beforeSlice.match(titleRegex);
 
         if (titleMatch && titleMatch[1]) {
-            charStart = divStart - titleMatch[1].length;
-            const rawName = titleMatch[2] || titleMatch[3] || titleMatch[4] || '';
-            fileName = unescapeMarkdownTitle(rawName);
-            showTitle = Boolean(titleMatch[2] || titleMatch[4]);
+            const titleUrl = titleMatch[3] || titleMatch[5] || '';
+            const titleFileId = titleUrl ? extractDriveIdFromText(titleUrl) : null;
+            if (!titleFileId || titleFileId === fileId) {
+                charStart = divStart - titleMatch[1].length;
+                const rawName = titleMatch[2] || titleMatch[4] || titleMatch[6] || '';
+                fileName = unescapeMarkdownTitle(rawName);
+                showTitle = Boolean(titleMatch[2] || titleMatch[6]);
+            }
         }
 
         // Fallback: extract filename from <img alt="..."> if not found in title
@@ -182,11 +186,11 @@ export function scanNoteContent(
         });
     }
 
-    // 2. Also detect standalone [📁 filename](https://drive.google.com/...) links not followed by a <div>
-    const standaloneLinkRegex = /^[ \t]*(?:\*\*\[📁\s*([^\n]+?)\]\((https:\/\/drive\.google\.com\/[^)\r\n]+)\)\*\*|\[📁\s*([^\n]+?)\]\((https:\/\/drive\.google\.com\/[^)\r\n]+)\))[ \t]*$/gm;
+    // 2. Also detect any Markdown links [label](https://drive.google.com/...) (including bullet lists, inline links, Smart Chips) not covered by a <div>
+    const markdownLinkRegex = /\*\*\[([^\n\]]+?)\]\((https:\/\/drive\.google\.com\/[^)\s]+)\)\*\*|\[([^\n\]]+?)\]\((https:\/\/drive\.google\.com\/[^)\s]+)\)/g;
     let linkMatch: RegExpExecArray | null;
 
-    while ((linkMatch = standaloneLinkRegex.exec(content)) !== null) {
+    while ((linkMatch = markdownLinkRegex.exec(content)) !== null) {
         const matchStart = linkMatch.index;
         const matchEnd = matchStart + linkMatch[0].length;
 
@@ -198,7 +202,7 @@ export function scanNoteContent(
             continue;
         }
 
-        const rawName = linkMatch[1] || linkMatch[3] || '';
+        const rawName = (linkMatch[1] || linkMatch[3] || '').replace(/^(?:📁|📄|📊|📽️|🖼️|🎬|🎵|🗃️)\s*/u, '');
         const rawUrl = linkMatch[2] || linkMatch[4] || '';
         const fileId = extractDriveIdFromText(rawUrl);
         if (!fileId) {

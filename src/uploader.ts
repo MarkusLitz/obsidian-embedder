@@ -12,6 +12,7 @@ export interface GoogleDriveConfig {
     accessToken: string;
     refreshToken: string;
     tokenExpiresAt: number;
+    driveFolder?: string;
     onTokenRefresh?: (tokens: OAuthTokens) => Promise<void>;
 }
 
@@ -296,12 +297,19 @@ export class GoogleDriveUploader {
     }
 
     /**
-     * List all non-trashed files uploaded by this plugin to Google Drive
+     * List all non-trashed files uploaded by this plugin inside the configured Drive folder
      */
-    async listUploadedFiles(): Promise<DriveFileMetadata[]> {
+    async listUploadedFiles(folderPath?: string): Promise<DriveFileMetadata[]> {
         try {
             const accessToken = await this.ensureValidToken();
-            const query = "mimeType!='application/vnd.google-apps.folder' and trashed=false";
+            const targetFolder = (folderPath ?? this.config.driveFolder ?? 'Obsidian/DriveEmbedder').trim();
+            const folderId = await this.resolveFolderId(targetFolder);
+            if (!folderId) {
+                return [];
+            }
+
+            const safeFolderId = folderId.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+            const query = `'${safeFolderId}' in parents and mimeType!='application/vnd.google-apps.folder' and trashed=false`;
             const fields = 'nextPageToken,files(id,name,mimeType,size,createdTime,modifiedTime,webViewLink,trashed)';
             const results: DriveFileMetadata[] = [];
             let pageToken = '';
@@ -434,10 +442,28 @@ export class GoogleDriveUploader {
     }
 
     /**
+     * Resolve an existing folder path on Google Drive without creating missing folders
+     */
+    private async resolveFolderId(folderPath: string): Promise<string | null> {
+        const parts = folderPath.split('/').map(p => p.trim()).filter(p => p.length > 0);
+        let parentId = 'root';
+
+        for (const folderName of parts) {
+            const existingId = await this.findFolder(folderName, parentId);
+            if (!existingId) {
+                return null;
+            }
+            parentId = existingId;
+        }
+
+        return parentId;
+    }
+
+    /**
      * Ensure folder exists, creating if necessary
      */
     private async ensureFolder(folderPath: string): Promise<string> {
-        const parts = folderPath.split('/').filter(p => p.length > 0);
+        const parts = folderPath.split('/').map(p => p.trim()).filter(p => p.length > 0);
         let parentId = 'root';
 
         for (const folderName of parts) {
