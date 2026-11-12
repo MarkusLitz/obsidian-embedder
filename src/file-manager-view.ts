@@ -44,6 +44,7 @@ export interface DriveManagerPluginHost {
     getEmbedGenerator(): EmbedGenerator;
     getShowTitleByDefault(): boolean;
     openUploadModalFromManager(): void;
+    reconnectGoogleDrive(): Promise<boolean>;
     triggerHydration(): void;
 }
 
@@ -551,6 +552,29 @@ export class DriveFileManagerView extends ItemView {
                 text: 'Not connected to Google Drive. Please connect in plugin settings.'
             });
             return;
+        }
+
+        if (this.host.getUploader()?.isAuthExpired()) {
+            const expiredBar = body.createDiv({ cls: 'drive-manager-cleanup-bar' });
+            expiredBar.createSpan({
+                text: '⚠️ Google Drive session expired',
+                cls: 'drive-cleanup-text'
+            });
+            const reconnectBtn = expiredBar.createEl('button', {
+                text: '🔑 Reconnect',
+                cls: 'drive-manager-icon-btn primary'
+            });
+            reconnectBtn.addEventListener('click', () => {
+                reconnectBtn.disabled = true;
+                reconnectBtn.textContent = '⏳...';
+                void this.host.reconnectGoogleDrive().then((ok) => {
+                    if (ok) {
+                        void this.refreshAll();
+                    } else {
+                        this.render();
+                    }
+                });
+            });
         }
 
         if (this.activeTab === 'note') {

@@ -12,6 +12,20 @@ export interface OAuthConfig {
     redirectPort: number;
 }
 
+export class GoogleAuthError extends Error {
+    readonly code: 'AUTH_EXPIRED' | 'OAUTH_ERROR';
+
+    constructor(message: string, code: 'AUTH_EXPIRED' | 'OAUTH_ERROR' = 'OAUTH_ERROR') {
+        super(message);
+        this.name = 'GoogleAuthError';
+        this.code = code;
+    }
+}
+
+export function isAuthExpiredError(error: unknown): error is GoogleAuthError {
+    return error instanceof GoogleAuthError && error.code === 'AUTH_EXPIRED';
+}
+
 export class GoogleOAuthFlow {
     private readonly AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
     private readonly TOKEN_URL = 'https://oauth2.googleapis.com/token';
@@ -189,6 +203,23 @@ export class GoogleOAuthFlow {
     }
 
     /**
+     * Parse OAuth error details safely without throwing on non-JSON bodies
+     */
+    private parseOAuthError(status: number, responseText?: string): { errorCode: string; description: string } {
+        if (responseText) {
+            try {
+                const parsed = JSON.parse(responseText) as { error?: unknown; error_description?: unknown };
+                const errorCode = typeof parsed.error === 'string' ? parsed.error : '';
+                const description = typeof parsed.error_description === 'string' ? parsed.error_description : '';
+                return { errorCode, description };
+            } catch {
+                // Ignore non-JSON body
+            }
+        }
+        return { errorCode: '', description: '' };
+    }
+
+    /**
      * Refresh access token using refresh token
      */
     async refreshAccessToken(refreshToken: string): Promise<OAuthTokens> {
@@ -204,24 +235,36 @@ export class GoogleOAuthFlow {
                     client_secret: this.config.clientSecret,
                     refresh_token: refreshToken,
                     grant_type: 'refresh_token'
-                }).toString()
+                }).toString(),
+                throw: false
             });
 
             if (response.status !== 200) {
-                throw new Error(`Token refresh failed: ${response.status}`);
+                const { errorCode, description } = this.parseOAuthError(response.status, response.text);
+                if (errorCode === 'invalid_grant' || response.status === 401) {
+                    throw new GoogleAuthError(
+                        'Google Drive session expired (refresh token expired or revoked). Please reconnect Google Drive.',
+                        'AUTH_EXPIRED'
+                    );
+                }
+                const detail = description || errorCode || `HTTP ${response.status}`;
+                throw new GoogleAuthError(`Token refresh failed: ${detail}`, 'OAUTH_ERROR');
             }
 
-            const data = response.json;
+            const data = JSON.parse(response.text);
             const expiresAt = Date.now() + (data.expires_in * 1000);
 
             return {
                 accessToken: data.access_token,
-                refreshToken: refreshToken, // Refresh token doesn't change
+                refreshToken: data.refresh_token || refreshToken,
                 expiresIn: data.expires_in,
                 expiresAt: expiresAt
             };
         } catch (error) {
             console.error('Token refresh error:', error);
+            if (error instanceof GoogleAuthError) {
+                throw error;
+            }
             const message = error instanceof Error ? error.message : String(error);
             throw new Error(`Failed to refresh token: ${message}`);
         }
@@ -256,14 +299,17 @@ export class GoogleOAuthFlow {
                 redirect_uri: redirectUri,
                 grant_type: 'authorization_code',
                 code_verifier: codeVerifier
-            }).toString()
+            }).toString(),
+            throw: false
         });
 
         if (response.status !== 200) {
-            throw new Error(`Token exchange failed: ${response.status}`);
+            const { errorCode, description } = this.parseOAuthError(response.status, response.text);
+            const detail = description || errorCode || `HTTP ${response.status}`;
+            throw new GoogleAuthError(`Token exchange failed: ${detail}`, 'OAUTH_ERROR');
         }
 
-        const data = response.json;
+        const data = JSON.parse(response.text);
         const expiresAt = Date.now() + (data.expires_in * 1000);
 
         return {

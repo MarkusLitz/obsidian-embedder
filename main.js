@@ -52,6 +52,16 @@ var DEFAULT_SETTINGS = {
 
 // src/google-oauth-flow.ts
 var import_obsidian = require("obsidian");
+var GoogleAuthError = class extends Error {
+  constructor(message, code = "OAUTH_ERROR") {
+    super(message);
+    this.name = "GoogleAuthError";
+    this.code = code;
+  }
+};
+function isAuthExpiredError(error) {
+  return error instanceof GoogleAuthError && error.code === "AUTH_EXPIRED";
+}
 var GoogleOAuthFlow = class {
   constructor(config) {
     this.AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
@@ -195,6 +205,21 @@ var GoogleOAuthFlow = class {
     });
   }
   /**
+   * Parse OAuth error details safely without throwing on non-JSON bodies
+   */
+  parseOAuthError(status, responseText) {
+    if (responseText) {
+      try {
+        const parsed = JSON.parse(responseText);
+        const errorCode = typeof parsed.error === "string" ? parsed.error : "";
+        const description = typeof parsed.error_description === "string" ? parsed.error_description : "";
+        return { errorCode, description };
+      } catch (e) {
+      }
+    }
+    return { errorCode: "", description: "" };
+  }
+  /**
    * Refresh access token using refresh token
    */
   async refreshAccessToken(refreshToken) {
@@ -210,22 +235,33 @@ var GoogleOAuthFlow = class {
           client_secret: this.config.clientSecret,
           refresh_token: refreshToken,
           grant_type: "refresh_token"
-        }).toString()
+        }).toString(),
+        throw: false
       });
       if (response.status !== 200) {
-        throw new Error(`Token refresh failed: ${response.status}`);
+        const { errorCode, description } = this.parseOAuthError(response.status, response.text);
+        if (errorCode === "invalid_grant" || response.status === 401) {
+          throw new GoogleAuthError(
+            "Google Drive session expired (refresh token expired or revoked). Please reconnect Google Drive.",
+            "AUTH_EXPIRED"
+          );
+        }
+        const detail = description || errorCode || `HTTP ${response.status}`;
+        throw new GoogleAuthError(`Token refresh failed: ${detail}`, "OAUTH_ERROR");
       }
-      const data = response.json;
+      const data = JSON.parse(response.text);
       const expiresAt = Date.now() + data.expires_in * 1e3;
       return {
         accessToken: data.access_token,
-        refreshToken,
-        // Refresh token doesn't change
+        refreshToken: data.refresh_token || refreshToken,
         expiresIn: data.expires_in,
         expiresAt
       };
     } catch (error) {
       console.error("Token refresh error:", error);
+      if (error instanceof GoogleAuthError) {
+        throw error;
+      }
       const message = error instanceof Error ? error.message : String(error);
       throw new Error(`Failed to refresh token: ${message}`);
     }
@@ -254,12 +290,15 @@ var GoogleOAuthFlow = class {
         redirect_uri: redirectUri,
         grant_type: "authorization_code",
         code_verifier: codeVerifier
-      }).toString()
+      }).toString(),
+      throw: false
     });
     if (response.status !== 200) {
-      throw new Error(`Token exchange failed: ${response.status}`);
+      const { errorCode, description } = this.parseOAuthError(response.status, response.text);
+      const detail = description || errorCode || `HTTP ${response.status}`;
+      throw new GoogleAuthError(`Token exchange failed: ${detail}`, "OAUTH_ERROR");
     }
-    const data = response.json;
+    const data = JSON.parse(response.text);
     const expiresAt = Date.now() + data.expires_in * 1e3;
     return {
       accessToken: data.access_token,
@@ -459,508 +498,6 @@ var GoogleOAuthFlow = class {
 
 // src/uploader.ts
 var import_obsidian2 = require("obsidian");
-var GoogleDriveUploader = class {
-  constructor(config) {
-    this.API_URL = "https://www.googleapis.com/drive/v3";
-    this.UPLOAD_URL = "https://www.googleapis.com/upload/drive/v3";
-    this.REDIRECT_PORT = 8586;
-    this.blobCache = /* @__PURE__ */ new Map();
-    this.inflightDownloads = /* @__PURE__ */ new Map();
-    this.config = config;
-    this.oauthFlow = new GoogleOAuthFlow({
-      clientId: config.clientId,
-      clientSecret: config.clientSecret,
-      redirectPort: this.REDIRECT_PORT
-    });
-  }
-  /**
-   * Start OAuth flow to connect Google Drive
-   */
-  async connectGoogleDrive() {
-    return this.oauthFlow.startOAuthFlow();
-  }
-  /**
-   * Check if connected to Google Drive
-   */
-  isConnected() {
-    return !!(this.config.accessToken && this.config.refreshToken);
-  }
-  /**
-   * Get cached local Blob URL if available
-   */
-  getCachedBlobUrl(fileId) {
-    return this.blobCache.get(fileId);
-  }
-  /**
-   * Revoke and remove a single cached Blob URL
-   */
-  revokeBlobUrl(fileId) {
-    const entry = this.blobCache.get(fileId);
-    if (entry) {
-      URL.revokeObjectURL(entry.blobUrl);
-      this.blobCache.delete(fileId);
-    }
-    this.inflightDownloads.delete(fileId);
-  }
-  /**
-   * Download a private file from Google Drive via authenticated API and return a local Blob URL
-   */
-  async downloadFileAsBlobUrl(fileId) {
-    if (!/^[a-zA-Z0-9_-]+$/.test(fileId)) {
-      return null;
-    }
-    const cached = this.blobCache.get(fileId);
-    if (cached) {
-      return cached;
-    }
-    const inflight = this.inflightDownloads.get(fileId);
-    if (inflight) {
-      return inflight;
-    }
-    const downloadPromise = (async () => {
-      try {
-        const accessToken = await this.ensureValidToken();
-        const response = await (0, import_obsidian2.requestUrl)({
-          url: `${this.API_URL}/files/${encodeURIComponent(fileId)}?alt=media`,
-          method: "GET",
-          headers: {
-            "Authorization": `Bearer ${accessToken}`
-          }
-        });
-        if (response.status !== 200) {
-          return null;
-        }
-        const rawType = response.headers["content-type"] || response.headers["Content-Type"] || "application/octet-stream";
-        let mimeType = rawType.split(";")[0].trim().toLowerCase();
-        if (response.arrayBuffer && response.arrayBuffer.byteLength >= 5) {
-          const magic = new Uint8Array(response.arrayBuffer, 0, 5);
-          if (magic[0] === 37 && // %
-          magic[1] === 80 && // P
-          magic[2] === 68 && // D
-          magic[3] === 70 && // F
-          magic[4] === 45) {
-            mimeType = "application/pdf";
-          }
-        }
-        const blob = new Blob([response.arrayBuffer], { type: mimeType });
-        const blobUrl = URL.createObjectURL(blob);
-        const entry = {
-          blobUrl,
-          mimeType,
-          arrayBuffer: mimeType === "application/pdf" ? response.arrayBuffer : void 0
-        };
-        this.blobCache.set(fileId, entry);
-        return entry;
-      } catch (error) {
-        console.error(`Failed to load private Drive file (${fileId}):`, error);
-        return null;
-      } finally {
-        this.inflightDownloads.delete(fileId);
-      }
-    })();
-    this.inflightDownloads.set(fileId, downloadPromise);
-    return downloadPromise;
-  }
-  /**
-   * Revoke all cached Blob URLs
-   */
-  revokeAllBlobUrls() {
-    for (const entry of this.blobCache.values()) {
-      URL.revokeObjectURL(entry.blobUrl);
-    }
-    this.blobCache.clear();
-    this.inflightDownloads.clear();
-  }
-  /**
-   * Ensure we have a valid access token, refreshing if necessary
-   */
-  async ensureValidToken() {
-    if (this.config.tokenExpiresAt && this.config.refreshToken) {
-      if (this.oauthFlow.isTokenExpired(this.config.tokenExpiresAt)) {
-        console.debug("Access token expired, refreshing...");
-        try {
-          const newTokens = await this.oauthFlow.refreshAccessToken(this.config.refreshToken);
-          this.config.accessToken = newTokens.accessToken;
-          this.config.tokenExpiresAt = newTokens.expiresAt;
-          if (this.config.onTokenRefresh) {
-            await this.config.onTokenRefresh(newTokens);
-          }
-          new import_obsidian2.Notice("Google Drive token automatically refreshed");
-        } catch (error) {
-          console.error("Token refresh failed:", error);
-          throw new Error("Token refresh failed. Please reconnect Google Drive.");
-        }
-      }
-    }
-    if (!this.config.accessToken) {
-      throw new Error("Not connected to Google Drive. Please connect first.");
-    }
-    return this.config.accessToken;
-  }
-  /**
-   * Upload a file to Google Drive with progress callback
-   */
-  async uploadFile(file, folderPath, onProgress) {
-    try {
-      onProgress == null ? void 0 : onProgress({
-        stage: "preparing",
-        message: "Preparing upload...",
-        progress: 10
-      });
-      const accessToken = await this.ensureValidToken();
-      const folderId = await this.ensureFolder(folderPath);
-      const arrayBuffer = await file.arrayBuffer();
-      const base64Content = this.arrayBufferToBase64(arrayBuffer);
-      onProgress == null ? void 0 : onProgress({
-        stage: "uploading",
-        message: "Uploading to Google Drive...",
-        progress: 30
-      });
-      const metadata = {
-        name: file.name,
-        mimeType: file.type,
-        parents: [folderId]
-      };
-      const boundary = "-------314159265358979323846";
-      const delimiter = `\r
---${boundary}\r
-`;
-      const closeDelimiter = `\r
---${boundary}--`;
-      const multipartBody = delimiter + "Content-Type: application/json\r\n\r\n" + JSON.stringify(metadata) + delimiter + `Content-Type: ${file.type}\r
-Content-Transfer-Encoding: base64\r
-\r
-` + base64Content + closeDelimiter;
-      const uploadResponse = await (0, import_obsidian2.requestUrl)({
-        url: `${this.UPLOAD_URL}/files?uploadType=multipart&fields=id,webViewLink,webContentLink,name,mimeType`,
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${accessToken}`,
-          "Content-Type": `multipart/related; boundary=${boundary}`
-        },
-        body: multipartBody
-      });
-      if (uploadResponse.status !== 200) {
-        throw new Error(`Upload failed: ${uploadResponse.status}`);
-      }
-      const fileData = uploadResponse.json;
-      const fileId = fileData.id;
-      try {
-        const normalizedMime = (file.type || "application/octet-stream").toLowerCase();
-        const localBlob = new Blob([arrayBuffer], { type: normalizedMime });
-        this.blobCache.set(fileId, {
-          blobUrl: URL.createObjectURL(localBlob),
-          mimeType: normalizedMime,
-          arrayBuffer: normalizedMime === "application/pdf" ? arrayBuffer : void 0
-        });
-      } catch (cacheErr) {
-        console.debug("Could not pre-cache blob URL:", cacheErr);
-      }
-      const fileInfo = await this.getFileInfo(fileId);
-      onProgress == null ? void 0 : onProgress({
-        stage: "complete",
-        message: "Upload complete!",
-        progress: 100
-      });
-      return {
-        fileId,
-        webViewLink: fileInfo.webViewLink || `https://drive.google.com/file/d/${fileId}/view`,
-        webContentLink: fileInfo.webContentLink || `https://drive.google.com/uc?export=view&id=${fileId}`,
-        fileName: file.name,
-        mimeType: file.type
-      };
-    } catch (error) {
-      console.error("Error uploading to Google Drive:", error);
-      const message = error instanceof Error ? error.message : String(error);
-      onProgress == null ? void 0 : onProgress({
-        stage: "error",
-        message: "Upload failed",
-        progress: 0,
-        error: message
-      });
-      return null;
-    }
-  }
-  /**
-   * List all non-trashed files uploaded by this plugin inside the configured Drive folder
-   */
-  async listUploadedFiles(folderPath) {
-    var _a;
-    try {
-      const accessToken = await this.ensureValidToken();
-      const targetFolder = ((_a = folderPath != null ? folderPath : this.config.driveFolder) != null ? _a : "Obsidian/DriveEmbedder").trim();
-      const folderId = await this.resolveFolderId(targetFolder);
-      if (!folderId) {
-        return [];
-      }
-      const safeFolderId = folderId.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-      const query = `'${safeFolderId}' in parents and mimeType!='application/vnd.google-apps.folder' and trashed=false`;
-      const fields = "nextPageToken,files(id,name,mimeType,size,createdTime,modifiedTime,webViewLink,trashed)";
-      const results = [];
-      let pageToken = "";
-      do {
-        const tokenParam = pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : "";
-        const response = await (0, import_obsidian2.requestUrl)({
-          url: `${this.API_URL}/files?q=${encodeURIComponent(query)}&fields=${encodeURIComponent(fields)}&orderBy=${encodeURIComponent("createdTime desc")}&pageSize=100${tokenParam}`,
-          method: "GET",
-          headers: {
-            "Authorization": `Bearer ${accessToken}`
-          }
-        });
-        if (response.status !== 200) {
-          break;
-        }
-        const data = response.json;
-        if (Array.isArray(data.files)) {
-          for (const f of data.files) {
-            results.push({
-              id: String(f.id),
-              name: String(f.name || f.id),
-              mimeType: String(f.mimeType || "application/octet-stream"),
-              size: f.size !== void 0 ? Number(f.size) : void 0,
-              createdTime: f.createdTime,
-              modifiedTime: f.modifiedTime,
-              webViewLink: f.webViewLink || `https://drive.google.com/file/d/${f.id}/view`,
-              trashed: Boolean(f.trashed)
-            });
-          }
-        }
-        pageToken = data.nextPageToken || "";
-      } while (pageToken && results.length < 500);
-      return results;
-    } catch (error) {
-      console.error("Error listing Google Drive files:", error);
-      return [];
-    }
-  }
-  /**
-   * Get metadata for a single file on Google Drive
-   */
-  async getFileMetadata(fileId) {
-    if (!/^[a-zA-Z0-9_-]+$/.test(fileId)) {
-      return null;
-    }
-    try {
-      const accessToken = await this.ensureValidToken();
-      const response = await (0, import_obsidian2.requestUrl)({
-        url: `${this.API_URL}/files/${encodeURIComponent(fileId)}?fields=id,name,mimeType,size,createdTime,modifiedTime,webViewLink,trashed&supportsAllDrives=true`,
-        method: "GET",
-        headers: {
-          "Authorization": `Bearer ${accessToken}`
-        }
-      });
-      if (response.status !== 200) {
-        return null;
-      }
-      const f = response.json;
-      return {
-        id: String(f.id),
-        name: String(f.name || f.id),
-        mimeType: String(f.mimeType || "application/octet-stream"),
-        size: f.size !== void 0 ? Number(f.size) : void 0,
-        createdTime: f.createdTime,
-        modifiedTime: f.modifiedTime,
-        webViewLink: f.webViewLink || `https://drive.google.com/file/d/${f.id}/view`,
-        trashed: Boolean(f.trashed)
-      };
-    } catch (error) {
-      return null;
-    }
-  }
-  /**
-   * Move a file to the Google Drive trash (trashed = true)
-   */
-  async trashFile(fileId) {
-    if (!/^[a-zA-Z0-9_-]+$/.test(fileId)) {
-      return false;
-    }
-    try {
-      const accessToken = await this.ensureValidToken();
-      const response = await (0, import_obsidian2.requestUrl)({
-        url: `${this.API_URL}/files/${encodeURIComponent(fileId)}`,
-        method: "PATCH",
-        headers: {
-          "Authorization": `Bearer ${accessToken}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({ trashed: true })
-      });
-      if (response.status >= 200 && response.status < 300) {
-        this.revokeBlobUrl(fileId);
-        return true;
-      }
-      return false;
-    } catch (error) {
-      console.error(`Failed to move Drive file (${fileId}) to trash:`, error);
-      return false;
-    }
-  }
-  /**
-   * Get file info from Google Drive
-   */
-  async getFileInfo(fileId) {
-    try {
-      const accessToken = await this.ensureValidToken();
-      const response = await (0, import_obsidian2.requestUrl)({
-        url: `${this.API_URL}/files/${encodeURIComponent(fileId)}?fields=webViewLink,webContentLink`,
-        method: "GET",
-        headers: {
-          "Authorization": `Bearer ${accessToken}`
-        }
-      });
-      return response.json;
-    } catch (error) {
-      return {};
-    }
-  }
-  /**
-   * Resolve an existing folder path on Google Drive without creating missing folders
-   */
-  async resolveFolderId(folderPath) {
-    const parts = folderPath.split("/").map((p) => p.trim()).filter((p) => p.length > 0);
-    let parentId = "root";
-    for (const folderName of parts) {
-      const existingId = await this.findFolder(folderName, parentId);
-      if (!existingId) {
-        return null;
-      }
-      parentId = existingId;
-    }
-    return parentId;
-  }
-  /**
-   * Ensure folder exists, creating if necessary
-   */
-  async ensureFolder(folderPath) {
-    const parts = folderPath.split("/").map((p) => p.trim()).filter((p) => p.length > 0);
-    let parentId = "root";
-    for (const folderName of parts) {
-      const existingId = await this.findFolder(folderName, parentId);
-      if (existingId) {
-        parentId = existingId;
-      } else {
-        parentId = await this.createFolder(folderName, parentId);
-      }
-    }
-    return parentId;
-  }
-  /**
-   * Find a folder by name
-   */
-  async findFolder(name, parentId) {
-    try {
-      const accessToken = await this.ensureValidToken();
-      const safeName = name.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-      const safeParentId = parentId.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-      const query = `name='${safeName}' and '${safeParentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`;
-      const response = await (0, import_obsidian2.requestUrl)({
-        url: `${this.API_URL}/files?q=${encodeURIComponent(query)}&fields=files(id)`,
-        method: "GET",
-        headers: {
-          "Authorization": `Bearer ${accessToken}`
-        }
-      });
-      if (response.status === 200) {
-        const data = response.json;
-        if (data.files && data.files.length > 0) {
-          return data.files[0].id;
-        }
-      }
-      return null;
-    } catch (error) {
-      return null;
-    }
-  }
-  /**
-   * Create a new folder
-   */
-  async createFolder(name, parentId) {
-    const accessToken = await this.ensureValidToken();
-    const metadata = {
-      name,
-      mimeType: "application/vnd.google-apps.folder",
-      parents: [parentId]
-    };
-    const response = await (0, import_obsidian2.requestUrl)({
-      url: `${this.API_URL}/files`,
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${accessToken}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(metadata)
-    });
-    if (response.status !== 200) {
-      throw new Error(`Folder creation failed: ${response.status}`);
-    }
-    return response.json.id;
-  }
-  /**
-   * Test the connection
-   */
-  async testConnection() {
-    try {
-      const accessToken = await this.ensureValidToken();
-      const response = await (0, import_obsidian2.requestUrl)({
-        url: `${this.API_URL}/about?fields=user`,
-        method: "GET",
-        headers: {
-          "Authorization": `Bearer ${accessToken}`
-        }
-      });
-      return response.status === 200;
-    } catch (error) {
-      return false;
-    }
-  }
-  /**
-   * Get user info
-   */
-  async getUserInfo() {
-    try {
-      const accessToken = await this.ensureValidToken();
-      const response = await (0, import_obsidian2.requestUrl)({
-        url: `${this.API_URL}/about?fields=user`,
-        method: "GET",
-        headers: {
-          "Authorization": `Bearer ${accessToken}`
-        }
-      });
-      if (response.status === 200) {
-        const data = response.json;
-        return {
-          email: data.user.emailAddress,
-          name: data.user.displayName
-        };
-      }
-      return null;
-    } catch (error) {
-      return null;
-    }
-  }
-  /**
-   * Disconnect from Google Drive
-   */
-  disconnect() {
-    this.config.accessToken = "";
-    this.config.refreshToken = "";
-    this.config.tokenExpiresAt = 0;
-  }
-  /**
-   * Convert ArrayBuffer to base64
-   */
-  arrayBufferToBase64(buffer) {
-    const bytes = new Uint8Array(buffer);
-    let binary = "";
-    for (let i = 0; i < bytes.length; i++) {
-      binary += String.fromCharCode(bytes[i]);
-    }
-    return btoa(binary);
-  }
-};
-
-// src/upload-modal.ts
-var import_obsidian3 = require("obsidian");
 
 // src/size-presets.ts
 var SIZE_PRESETS = {
@@ -1149,18 +686,678 @@ function getCategoryIcon(category) {
   return icons[category];
 }
 
+// src/uploader.ts
+var GoogleDriveUploader = class {
+  constructor(config) {
+    this.API_URL = "https://www.googleapis.com/drive/v3";
+    this.UPLOAD_URL = "https://www.googleapis.com/upload/drive/v3";
+    this.REDIRECT_PORT = 8586;
+    this.SINGLE_PUT_MAX_BYTES = 16 * 1024 * 1024;
+    // 16 MiB
+    this.RESUMABLE_CHUNK_BYTES = 8 * 1024 * 1024;
+    // 8 MiB (multiple of 256 KiB)
+    this.MAX_PRECACHE_BYTES = 50 * 1024 * 1024;
+    this.blobCache = /* @__PURE__ */ new Map();
+    this.inflightDownloads = /* @__PURE__ */ new Map();
+    this.inflightTokenRefresh = null;
+    this.authExpired = false;
+    this.hasShownAuthExpiredNotice = false;
+    this.config = config;
+    this.oauthFlow = new GoogleOAuthFlow({
+      clientId: config.clientId,
+      clientSecret: config.clientSecret,
+      redirectPort: this.REDIRECT_PORT
+    });
+  }
+  /**
+   * Whether the Google OAuth refresh token is known to be expired or revoked
+   */
+  isAuthExpired() {
+    return this.authExpired;
+  }
+  /**
+   * Start OAuth flow to connect Google Drive
+   */
+  async connectGoogleDrive() {
+    return this.oauthFlow.startOAuthFlow();
+  }
+  /**
+   * Check if connected to Google Drive
+   */
+  isConnected() {
+    return !!(this.config.accessToken && this.config.refreshToken);
+  }
+  /**
+   * Get cached local Blob URL if available
+   */
+  getCachedBlobUrl(fileId) {
+    return this.blobCache.get(fileId);
+  }
+  /**
+   * Revoke and remove a single cached Blob URL
+   */
+  revokeBlobUrl(fileId) {
+    const entry = this.blobCache.get(fileId);
+    if (entry) {
+      URL.revokeObjectURL(entry.blobUrl);
+      this.blobCache.delete(fileId);
+    }
+    this.inflightDownloads.delete(fileId);
+  }
+  /**
+   * Download a private file from Google Drive via authenticated API and return a local Blob URL
+   */
+  async downloadFileAsBlobUrl(fileId) {
+    if (!/^[a-zA-Z0-9_-]+$/.test(fileId)) {
+      return null;
+    }
+    const cached = this.blobCache.get(fileId);
+    if (cached) {
+      return cached;
+    }
+    const inflight = this.inflightDownloads.get(fileId);
+    if (inflight) {
+      return inflight;
+    }
+    const downloadPromise = (async () => {
+      try {
+        const accessToken = await this.ensureValidToken();
+        const response = await (0, import_obsidian2.requestUrl)({
+          url: `${this.API_URL}/files/${encodeURIComponent(fileId)}?alt=media`,
+          method: "GET",
+          headers: {
+            "Authorization": `Bearer ${accessToken}`
+          }
+        });
+        if (response.status !== 200) {
+          return null;
+        }
+        const rawType = response.headers["content-type"] || response.headers["Content-Type"] || "application/octet-stream";
+        let mimeType = rawType.split(";")[0].trim().toLowerCase();
+        if (response.arrayBuffer && response.arrayBuffer.byteLength >= 5) {
+          const magic = new Uint8Array(response.arrayBuffer, 0, 5);
+          if (magic[0] === 37 && // %
+          magic[1] === 80 && // P
+          magic[2] === 68 && // D
+          magic[3] === 70 && // F
+          magic[4] === 45) {
+            mimeType = "application/pdf";
+          }
+        }
+        const blob = new Blob([response.arrayBuffer], { type: mimeType });
+        const blobUrl = URL.createObjectURL(blob);
+        const entry = {
+          blobUrl,
+          mimeType,
+          arrayBuffer: mimeType === "application/pdf" ? response.arrayBuffer : void 0
+        };
+        this.blobCache.set(fileId, entry);
+        return entry;
+      } catch (error) {
+        console.error(`Failed to load private Drive file (${fileId}):`, error);
+        return null;
+      } finally {
+        this.inflightDownloads.delete(fileId);
+      }
+    })();
+    this.inflightDownloads.set(fileId, downloadPromise);
+    return downloadPromise;
+  }
+  /**
+   * Revoke all cached Blob URLs
+   */
+  revokeAllBlobUrls() {
+    for (const entry of this.blobCache.values()) {
+      URL.revokeObjectURL(entry.blobUrl);
+    }
+    this.blobCache.clear();
+    this.inflightDownloads.clear();
+  }
+  /**
+   * Read a response header case-insensitively across Desktop (Electron) and Mobile WebViews
+   */
+  getHeader(headers, name) {
+    if (!headers) {
+      return void 0;
+    }
+    const target = name.toLowerCase();
+    for (const [key, value] of Object.entries(headers)) {
+      if (key.toLowerCase() === target) {
+        return value;
+      }
+    }
+    return void 0;
+  }
+  /**
+   * Extract a readable Google Drive API error message from a failed HTTP response
+   */
+  parseGoogleApiError(status, responseText) {
+    var _a;
+    if (responseText) {
+      try {
+        const parsed = JSON.parse(responseText);
+        const detail = typeof parsed.error === "object" && ((_a = parsed.error) == null ? void 0 : _a.message) || parsed.error_description || (typeof parsed.error === "string" ? parsed.error : "");
+        if (detail && detail.trim()) {
+          return `Google Drive API error (${status}): ${detail.trim()}`;
+        }
+      } catch (e) {
+      }
+    }
+    return `Google Drive API error (HTTP ${status})`;
+  }
+  /**
+   * Ensure we have a valid access token, refreshing if necessary (with concurrent deduplication)
+   */
+  async ensureValidToken(forceRefresh = false) {
+    const needsRefresh = forceRefresh || !this.config.accessToken && !!this.config.refreshToken || !!this.config.tokenExpiresAt && this.oauthFlow.isTokenExpired(this.config.tokenExpiresAt);
+    if (needsRefresh) {
+      if (!this.config.refreshToken) {
+        this.authExpired = true;
+        throw new GoogleAuthError(
+          "Not connected to Google Drive (missing refresh token). Please reconnect in settings.",
+          "AUTH_EXPIRED"
+        );
+      }
+      if (this.inflightTokenRefresh) {
+        return this.inflightTokenRefresh;
+      }
+      this.inflightTokenRefresh = (async () => {
+        console.debug("Access token expired or refresh requested, refreshing...");
+        try {
+          const newTokens = await this.oauthFlow.refreshAccessToken(this.config.refreshToken);
+          this.config.accessToken = newTokens.accessToken;
+          this.config.refreshToken = newTokens.refreshToken;
+          this.config.tokenExpiresAt = newTokens.expiresAt;
+          this.authExpired = false;
+          this.hasShownAuthExpiredNotice = false;
+          if (this.config.onTokenRefresh) {
+            await this.config.onTokenRefresh(newTokens);
+          }
+          return this.config.accessToken;
+        } catch (error) {
+          console.error("Token refresh failed:", error);
+          if (isAuthExpiredError(error)) {
+            this.authExpired = true;
+            if (!this.hasShownAuthExpiredNotice) {
+              this.hasShownAuthExpiredNotice = true;
+              new import_obsidian2.Notice(
+                '\u26A0\uFE0F Google Drive session expired. Please click "Reconnect" in Drive Embedder.',
+                8e3
+              );
+            }
+            throw error;
+          }
+          const detail = error instanceof Error ? error.message : String(error);
+          throw new Error(`Token refresh failed (${detail}). Please check your connection or reconnect Google Drive.`);
+        } finally {
+          this.inflightTokenRefresh = null;
+        }
+      })();
+      return this.inflightTokenRefresh;
+    }
+    if (!this.config.accessToken) {
+      throw new GoogleAuthError(
+        "Not connected to Google Drive. Please connect first.",
+        "AUTH_EXPIRED"
+      );
+    }
+    return this.config.accessToken;
+  }
+  /**
+   * Upload a file to Google Drive via binary resumable upload (no 5 MB multipart limit or Base64 overhead)
+   */
+  async uploadFile(file, folderPath, onProgress) {
+    var _a;
+    try {
+      onProgress == null ? void 0 : onProgress({
+        stage: "preparing",
+        message: "Preparing upload...",
+        progress: 10
+      });
+      let accessToken = await this.ensureValidToken();
+      const resolvedMimeType = (file.type || ((_a = getFileTypeInfo(file.name)) == null ? void 0 : _a.mimeType) || "application/octet-stream").split(";")[0].trim() || "application/octet-stream";
+      const folderId = await this.ensureFolder(folderPath);
+      onProgress == null ? void 0 : onProgress({
+        stage: "uploading",
+        message: "Initializing upload session...",
+        progress: 20
+      });
+      const totalBytes = file.size;
+      const metadata = {
+        name: file.name,
+        mimeType: resolvedMimeType,
+        parents: [folderId]
+      };
+      const initiateSession = (token) => (0, import_obsidian2.requestUrl)({
+        url: `${this.UPLOAD_URL}/files?uploadType=resumable&fields=id,webViewLink,webContentLink,name,mimeType`,
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${token}`,
+          "Content-Type": "application/json; charset=UTF-8",
+          "X-Upload-Content-Type": resolvedMimeType,
+          "X-Upload-Content-Length": String(totalBytes)
+        },
+        body: JSON.stringify(metadata),
+        throw: false
+      });
+      let initResponse = await initiateSession(accessToken);
+      if (initResponse.status === 401 && this.config.refreshToken) {
+        accessToken = await this.ensureValidToken(true);
+        initResponse = await initiateSession(accessToken);
+      }
+      if (initResponse.status !== 200) {
+        throw new Error(this.parseGoogleApiError(initResponse.status, initResponse.text));
+      }
+      const sessionUri = this.getHeader(initResponse.headers, "location");
+      if (!sessionUri) {
+        throw new Error("Google Drive did not return a resumable upload session URL.");
+      }
+      let fileData = null;
+      let fullBufferForCache;
+      if (totalBytes <= this.SINGLE_PUT_MAX_BYTES) {
+        const arrayBuffer = await file.arrayBuffer();
+        onProgress == null ? void 0 : onProgress({
+          stage: "uploading",
+          message: "Uploading to Google Drive...",
+          progress: 45
+        });
+        const uploadResponse = await (0, import_obsidian2.requestUrl)({
+          url: sessionUri,
+          method: "PUT",
+          contentType: resolvedMimeType,
+          body: arrayBuffer,
+          throw: false
+        });
+        if (uploadResponse.status !== 200 && uploadResponse.status !== 201) {
+          throw new Error(this.parseGoogleApiError(uploadResponse.status, uploadResponse.text));
+        }
+        fileData = JSON.parse(uploadResponse.text);
+        fullBufferForCache = arrayBuffer;
+      } else {
+        let offset = 0;
+        while (offset < totalBytes) {
+          const end = Math.min(offset + this.RESUMABLE_CHUNK_BYTES, totalBytes);
+          const chunkBuffer = await file.slice(offset, end).arrayBuffer();
+          const pct = Math.round(offset / totalBytes * 100);
+          onProgress == null ? void 0 : onProgress({
+            stage: "uploading",
+            message: `Uploading to Google Drive (${pct}%)...`,
+            progress: 25 + Math.round(offset / totalBytes * 65)
+          });
+          const chunkResponse = await (0, import_obsidian2.requestUrl)({
+            url: sessionUri,
+            method: "PUT",
+            contentType: resolvedMimeType,
+            headers: {
+              "Content-Range": `bytes ${offset}-${end - 1}/${totalBytes}`
+            },
+            body: chunkBuffer,
+            throw: false
+          });
+          if (end < totalBytes) {
+            if (chunkResponse.status !== 308 && chunkResponse.status !== 200 && chunkResponse.status !== 201) {
+              throw new Error(this.parseGoogleApiError(chunkResponse.status, chunkResponse.text));
+            }
+            if (chunkResponse.status === 200 || chunkResponse.status === 201) {
+              fileData = JSON.parse(chunkResponse.text);
+              break;
+            }
+            const rangeHeader = this.getHeader(chunkResponse.headers, "range");
+            const rangeMatch = rangeHeader ? rangeHeader.match(/bytes=0-(\d+)/i) : null;
+            offset = rangeMatch && rangeMatch[1] ? parseInt(rangeMatch[1], 10) + 1 : end;
+          } else {
+            if (chunkResponse.status !== 200 && chunkResponse.status !== 201) {
+              throw new Error(this.parseGoogleApiError(chunkResponse.status, chunkResponse.text));
+            }
+            fileData = JSON.parse(chunkResponse.text);
+            offset = end;
+          }
+        }
+      }
+      const fileId = fileData == null ? void 0 : fileData.id;
+      if (!fileId) {
+        throw new Error("Google Drive upload completed without returning a file ID.");
+      }
+      if (totalBytes <= this.MAX_PRECACHE_BYTES) {
+        try {
+          const normalizedMime = resolvedMimeType.toLowerCase();
+          const localBlob = fullBufferForCache ? new Blob([fullBufferForCache], { type: normalizedMime }) : new Blob([file], { type: normalizedMime });
+          this.blobCache.set(fileId, {
+            blobUrl: URL.createObjectURL(localBlob),
+            mimeType: normalizedMime,
+            arrayBuffer: normalizedMime === "application/pdf" ? fullBufferForCache : void 0
+          });
+        } catch (cacheErr) {
+          console.debug("Could not pre-cache blob URL:", cacheErr);
+        }
+      }
+      let webViewLink = fileData == null ? void 0 : fileData.webViewLink;
+      let webContentLink = fileData == null ? void 0 : fileData.webContentLink;
+      if (!webViewLink) {
+        const fileInfo = await this.getFileInfo(fileId);
+        webViewLink = fileInfo.webViewLink;
+        webContentLink = webContentLink || fileInfo.webContentLink;
+      }
+      onProgress == null ? void 0 : onProgress({
+        stage: "complete",
+        message: "Upload complete!",
+        progress: 100
+      });
+      return {
+        fileId,
+        webViewLink: webViewLink || `https://drive.google.com/file/d/${fileId}/view`,
+        webContentLink: webContentLink || `https://drive.google.com/uc?export=view&id=${fileId}`,
+        fileName: file.name,
+        mimeType: resolvedMimeType
+      };
+    } catch (error) {
+      console.error("Error uploading to Google Drive:", error);
+      const message = error instanceof Error ? error.message : String(error);
+      onProgress == null ? void 0 : onProgress({
+        stage: "error",
+        message: "Upload failed",
+        progress: 0,
+        error: message
+      });
+      throw error instanceof Error ? error : new Error(message);
+    }
+  }
+  /**
+   * List all non-trashed files uploaded by this plugin inside the configured Drive folder
+   */
+  async listUploadedFiles(folderPath) {
+    var _a;
+    try {
+      const accessToken = await this.ensureValidToken();
+      const targetFolder = ((_a = folderPath != null ? folderPath : this.config.driveFolder) != null ? _a : "Obsidian/DriveEmbedder").trim();
+      const folderId = await this.resolveFolderId(targetFolder);
+      if (!folderId) {
+        return [];
+      }
+      const safeFolderId = folderId.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+      const query = `'${safeFolderId}' in parents and mimeType!='application/vnd.google-apps.folder' and trashed=false`;
+      const fields = "nextPageToken,files(id,name,mimeType,size,createdTime,modifiedTime,webViewLink,trashed)";
+      const results = [];
+      let pageToken = "";
+      do {
+        const tokenParam = pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : "";
+        const response = await (0, import_obsidian2.requestUrl)({
+          url: `${this.API_URL}/files?q=${encodeURIComponent(query)}&fields=${encodeURIComponent(fields)}&orderBy=${encodeURIComponent("createdTime desc")}&pageSize=100${tokenParam}`,
+          method: "GET",
+          headers: {
+            "Authorization": `Bearer ${accessToken}`
+          }
+        });
+        if (response.status !== 200) {
+          break;
+        }
+        const data = response.json;
+        if (Array.isArray(data.files)) {
+          for (const f of data.files) {
+            results.push({
+              id: String(f.id),
+              name: String(f.name || f.id),
+              mimeType: String(f.mimeType || "application/octet-stream"),
+              size: f.size !== void 0 ? Number(f.size) : void 0,
+              createdTime: f.createdTime,
+              modifiedTime: f.modifiedTime,
+              webViewLink: f.webViewLink || `https://drive.google.com/file/d/${f.id}/view`,
+              trashed: Boolean(f.trashed)
+            });
+          }
+        }
+        pageToken = data.nextPageToken || "";
+      } while (pageToken && results.length < 500);
+      return results;
+    } catch (error) {
+      console.error("Error listing Google Drive files:", error);
+      return [];
+    }
+  }
+  /**
+   * Get metadata for a single file on Google Drive
+   */
+  async getFileMetadata(fileId) {
+    if (!/^[a-zA-Z0-9_-]+$/.test(fileId)) {
+      return null;
+    }
+    try {
+      const accessToken = await this.ensureValidToken();
+      const response = await (0, import_obsidian2.requestUrl)({
+        url: `${this.API_URL}/files/${encodeURIComponent(fileId)}?fields=id,name,mimeType,size,createdTime,modifiedTime,webViewLink,trashed&supportsAllDrives=true`,
+        method: "GET",
+        headers: {
+          "Authorization": `Bearer ${accessToken}`
+        }
+      });
+      if (response.status !== 200) {
+        return null;
+      }
+      const f = response.json;
+      return {
+        id: String(f.id),
+        name: String(f.name || f.id),
+        mimeType: String(f.mimeType || "application/octet-stream"),
+        size: f.size !== void 0 ? Number(f.size) : void 0,
+        createdTime: f.createdTime,
+        modifiedTime: f.modifiedTime,
+        webViewLink: f.webViewLink || `https://drive.google.com/file/d/${f.id}/view`,
+        trashed: Boolean(f.trashed)
+      };
+    } catch (error) {
+      return null;
+    }
+  }
+  /**
+   * Move a file to the Google Drive trash (trashed = true)
+   */
+  async trashFile(fileId) {
+    if (!/^[a-zA-Z0-9_-]+$/.test(fileId)) {
+      return false;
+    }
+    try {
+      const accessToken = await this.ensureValidToken();
+      const response = await (0, import_obsidian2.requestUrl)({
+        url: `${this.API_URL}/files/${encodeURIComponent(fileId)}`,
+        method: "PATCH",
+        headers: {
+          "Authorization": `Bearer ${accessToken}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ trashed: true })
+      });
+      if (response.status >= 200 && response.status < 300) {
+        this.revokeBlobUrl(fileId);
+        return true;
+      }
+      return false;
+    } catch (error) {
+      console.error(`Failed to move Drive file (${fileId}) to trash:`, error);
+      return false;
+    }
+  }
+  /**
+   * Get file info from Google Drive
+   */
+  async getFileInfo(fileId) {
+    try {
+      const accessToken = await this.ensureValidToken();
+      const response = await (0, import_obsidian2.requestUrl)({
+        url: `${this.API_URL}/files/${encodeURIComponent(fileId)}?fields=webViewLink,webContentLink`,
+        method: "GET",
+        headers: {
+          "Authorization": `Bearer ${accessToken}`
+        }
+      });
+      return response.json;
+    } catch (error) {
+      return {};
+    }
+  }
+  /**
+   * Resolve an existing folder path on Google Drive without creating missing folders
+   */
+  async resolveFolderId(folderPath) {
+    const parts = folderPath.split("/").map((p) => p.trim()).filter((p) => p.length > 0);
+    let parentId = "root";
+    for (const folderName of parts) {
+      const existingId = await this.findFolder(folderName, parentId);
+      if (!existingId) {
+        return null;
+      }
+      parentId = existingId;
+    }
+    return parentId;
+  }
+  /**
+   * Ensure folder exists, creating if necessary
+   */
+  async ensureFolder(folderPath) {
+    const parts = folderPath.split("/").map((p) => p.trim()).filter((p) => p.length > 0);
+    let parentId = "root";
+    for (const folderName of parts) {
+      const existingId = await this.findFolder(folderName, parentId);
+      if (existingId) {
+        parentId = existingId;
+      } else {
+        parentId = await this.createFolder(folderName, parentId);
+      }
+    }
+    return parentId;
+  }
+  /**
+   * Find a folder by name
+   */
+  async findFolder(name, parentId) {
+    let accessToken = await this.ensureValidToken();
+    const safeName = name.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const safeParentId = parentId.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const query = `name='${safeName}' and '${safeParentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`;
+    const url = `${this.API_URL}/files?q=${encodeURIComponent(query)}&fields=files(id)`;
+    let response = await (0, import_obsidian2.requestUrl)({
+      url,
+      method: "GET",
+      headers: {
+        "Authorization": `Bearer ${accessToken}`
+      },
+      throw: false
+    });
+    if (response.status === 401 && this.config.refreshToken) {
+      accessToken = await this.ensureValidToken(true);
+      response = await (0, import_obsidian2.requestUrl)({
+        url,
+        method: "GET",
+        headers: {
+          "Authorization": `Bearer ${accessToken}`
+        },
+        throw: false
+      });
+    }
+    if (response.status !== 200) {
+      throw new Error(this.parseGoogleApiError(response.status, response.text));
+    }
+    const data = JSON.parse(response.text);
+    if (data.files && data.files.length > 0) {
+      return data.files[0].id;
+    }
+    return null;
+  }
+  /**
+   * Create a new folder
+   */
+  async createFolder(name, parentId) {
+    const accessToken = await this.ensureValidToken();
+    const metadata = {
+      name,
+      mimeType: "application/vnd.google-apps.folder",
+      parents: [parentId]
+    };
+    const response = await (0, import_obsidian2.requestUrl)({
+      url: `${this.API_URL}/files`,
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${accessToken}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(metadata),
+      throw: false
+    });
+    if (response.status !== 200) {
+      throw new Error(this.parseGoogleApiError(response.status, response.text));
+    }
+    return JSON.parse(response.text).id;
+  }
+  /**
+   * Test the connection
+   */
+  async testConnection() {
+    try {
+      const accessToken = await this.ensureValidToken();
+      const response = await (0, import_obsidian2.requestUrl)({
+        url: `${this.API_URL}/about?fields=user`,
+        method: "GET",
+        headers: {
+          "Authorization": `Bearer ${accessToken}`
+        }
+      });
+      return response.status === 200;
+    } catch (error) {
+      return false;
+    }
+  }
+  /**
+   * Get user info
+   */
+  async getUserInfo() {
+    try {
+      const accessToken = await this.ensureValidToken();
+      const response = await (0, import_obsidian2.requestUrl)({
+        url: `${this.API_URL}/about?fields=user`,
+        method: "GET",
+        headers: {
+          "Authorization": `Bearer ${accessToken}`
+        }
+      });
+      if (response.status === 200) {
+        const data = response.json;
+        return {
+          email: data.user.emailAddress,
+          name: data.user.displayName
+        };
+      }
+      return null;
+    } catch (error) {
+      return null;
+    }
+  }
+  /**
+   * Disconnect from Google Drive
+   */
+  disconnect() {
+    this.config.accessToken = "";
+    this.config.refreshToken = "";
+    this.config.tokenExpiresAt = 0;
+    this.authExpired = false;
+    this.hasShownAuthExpiredNotice = false;
+  }
+};
+
 // src/upload-modal.ts
+var import_obsidian3 = require("obsidian");
 var UploadModal = class extends import_obsidian3.Modal {
-  constructor(app, uploader, driveFolder, defaultShowTitle, onComplete) {
+  constructor(app, uploader, driveFolder, defaultShowTitle, onComplete, onReconnect) {
     super(app);
     this.queuedItems = [];
     this.showTitle = true;
     this.isUploading = false;
+    this.authExpired = false;
     // UI Elements
+    this.authBannerEl = null;
     this.fileInputEl = null;
     this.fileInfoEl = null;
     this.sizeOptionsEl = null;
     this.progressEl = null;
+    this.reconnectBtn = null;
     this.uploadBtn = null;
     // Progress UI Elements
     this.progressFillEl = null;
@@ -1170,6 +1367,8 @@ var UploadModal = class extends import_obsidian3.Modal {
     this.driveFolder = driveFolder;
     this.showTitle = defaultShowTitle;
     this.onComplete = onComplete;
+    this.onReconnect = onReconnect;
+    this.authExpired = uploader.isAuthExpired();
   }
   onOpen() {
     const { contentEl } = this;
@@ -1183,12 +1382,17 @@ var UploadModal = class extends import_obsidian3.Modal {
       text: "upload one or multiple files to Google Drive and insert embeds.",
       cls: "drive-embedder-subtitle"
     });
+    this.authBannerEl = contentEl.createDiv({ cls: "drive-auth-expired-banner hidden" });
+    this.authBannerEl.createSpan({
+      text: '\u26A0\uFE0F Google Drive session expired (refresh token expired or revoked). Click "Reconnect" below to sign in again.'
+    });
     this.createFileSection(contentEl);
     this.fileInfoEl = contentEl.createDiv({ cls: "drive-embedder-file-info hidden" });
     this.sizeOptionsEl = contentEl.createDiv({ cls: "drive-embedder-size-options hidden" });
     this.createTitleToggle(contentEl);
     this.progressEl = contentEl.createDiv({ cls: "drive-embedder-progress hidden" });
     this.createActionButtons(contentEl);
+    this.updateUploadButtonState();
     this.createSupportedFormatsInfo(contentEl);
   }
   createFileSection(container) {
@@ -1285,9 +1489,30 @@ var UploadModal = class extends import_obsidian3.Modal {
     this.updateUploadButtonState();
   }
   updateUploadButtonState() {
+    const count = this.queuedItems.length;
+    if (this.authBannerEl) {
+      if (this.authExpired) {
+        this.authBannerEl.removeClass("hidden");
+      } else {
+        this.authBannerEl.addClass("hidden");
+      }
+    }
+    if (this.reconnectBtn && this.onReconnect) {
+      if (this.authExpired) {
+        this.reconnectBtn.removeClass("hidden");
+        this.reconnectBtn.disabled = this.isUploading;
+        this.reconnectBtn.textContent = count > 0 ? "\u{1F511} Reconnect & upload" : "\u{1F511} Reconnect Google Drive";
+        if (this.uploadBtn) {
+          this.uploadBtn.addClass("hidden");
+        }
+        return;
+      } else {
+        this.reconnectBtn.addClass("hidden");
+      }
+    }
     if (!this.uploadBtn)
       return;
-    const count = this.queuedItems.length;
+    this.uploadBtn.removeClass("hidden");
     if (count === 0) {
       this.uploadBtn.disabled = true;
       this.uploadBtn.textContent = "\u{1F4E4} upload and embed";
@@ -1480,6 +1705,15 @@ var UploadModal = class extends import_obsidian3.Modal {
       cls: "drive-embedder-btn cancel"
     });
     cancelBtn.addEventListener("click", () => this.close());
+    if (this.onReconnect) {
+      this.reconnectBtn = buttonContainer.createEl("button", {
+        text: "\u{1F511} Reconnect & upload",
+        cls: "drive-embedder-btn primary hidden"
+      });
+      this.reconnectBtn.addEventListener("click", () => {
+        void this.handleReconnectAndUpload();
+      });
+    }
     this.uploadBtn = buttonContainer.createEl("button", {
       text: "\u{1F4E4} upload and embed",
       cls: "drive-embedder-btn primary"
@@ -1488,6 +1722,38 @@ var UploadModal = class extends import_obsidian3.Modal {
     this.uploadBtn.addEventListener("click", () => {
       void this.handleUpload();
     });
+  }
+  async handleReconnectAndUpload() {
+    if (!this.onReconnect || this.isUploading) {
+      return;
+    }
+    if (this.reconnectBtn) {
+      this.reconnectBtn.disabled = true;
+      this.reconnectBtn.textContent = "\u{1F511} Waiting for browser login...";
+    }
+    try {
+      const freshUploader = await this.onReconnect();
+      if (freshUploader) {
+        this.uploader = freshUploader;
+        this.authExpired = false;
+        for (const item of this.queuedItems) {
+          if (item.status === "error") {
+            item.status = "pending";
+            item.errorMessage = void 0;
+          }
+        }
+        this.refreshQueueAndSizeUI();
+        if (this.queuedItems.length > 0) {
+          await this.handleUpload();
+        }
+        return;
+      }
+    } finally {
+      if (this.reconnectBtn) {
+        this.reconnectBtn.disabled = false;
+      }
+      this.updateUploadButtonState();
+    }
   }
   createSupportedFormatsInfo(container) {
     const infoSection = container.createDiv({ cls: "drive-embedder-formats-info" });
@@ -1508,6 +1774,7 @@ var UploadModal = class extends import_obsidian3.Modal {
     });
   }
   async handleUpload() {
+    var _a;
     if (this.queuedItems.length === 0 || this.isUploading) {
       new import_obsidian3.Notice("please select at least one file.");
       return;
@@ -1538,9 +1805,6 @@ var UploadModal = class extends import_obsidian3.Modal {
             });
           }
         );
-        if (!result) {
-          throw new Error("Failed to receive upload result.");
-        }
         item.status = "done";
         finishedCount++;
         completedResults.push({
@@ -1558,6 +1822,15 @@ var UploadModal = class extends import_obsidian3.Modal {
         item.status = "error";
         item.errorMessage = message;
         finishedCount++;
+        if (isAuthExpiredError(error)) {
+          this.authExpired = true;
+          for (let j = i + 1; j < this.queuedItems.length; j++) {
+            this.queuedItems[j].status = "error";
+            this.queuedItems[j].errorMessage = message;
+          }
+          this.updateFileInfo();
+          break;
+        }
         this.updateFileInfo();
       }
     }
@@ -1575,12 +1848,17 @@ var UploadModal = class extends import_obsidian3.Modal {
       this.queuedItems = failedItems;
       this.hideProgress();
       this.refreshQueueAndSizeUI();
-      if (this.uploadBtn) {
+      if (!this.authExpired && this.uploadBtn) {
         this.uploadBtn.textContent = `\u{1F504} retry failed (${failedItems.length})`;
       }
-      new import_obsidian3.Notice(
-        completedResults.length > 0 ? `\u26A0\uFE0F ${completedResults.length} uploaded, ${failedItems.length} failed. You can retry the failed files.` : `\u274C upload failed for ${failedItems.length} file(s).`
-      );
+      if (this.authExpired) {
+        new import_obsidian3.Notice('\u26A0\uFE0F Google Drive session expired. Click "Reconnect & upload" to sign in again.');
+      } else {
+        const firstError = ((_a = failedItems[0]) == null ? void 0 : _a.errorMessage) || "Unknown error";
+        new import_obsidian3.Notice(
+          completedResults.length > 0 ? `\u26A0\uFE0F ${completedResults.length} uploaded, ${failedItems.length} failed: ${firstError}` : `\u274C upload failed: ${firstError}`
+        );
+      }
     }
   }
   showProgress() {
@@ -2385,6 +2663,7 @@ var DriveFileManagerView = class extends import_obsidian4.ItemView {
     return results;
   }
   render() {
+    var _a;
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("drive-manager-view");
@@ -2440,6 +2719,28 @@ var DriveFileManagerView = class extends import_obsidian4.ItemView {
         text: "Not connected to Google Drive. Please connect in plugin settings."
       });
       return;
+    }
+    if ((_a = this.host.getUploader()) == null ? void 0 : _a.isAuthExpired()) {
+      const expiredBar = body.createDiv({ cls: "drive-manager-cleanup-bar" });
+      expiredBar.createSpan({
+        text: "\u26A0\uFE0F Google Drive session expired",
+        cls: "drive-cleanup-text"
+      });
+      const reconnectBtn = expiredBar.createEl("button", {
+        text: "\u{1F511} Reconnect",
+        cls: "drive-manager-icon-btn primary"
+      });
+      reconnectBtn.addEventListener("click", () => {
+        reconnectBtn.disabled = true;
+        reconnectBtn.textContent = "\u23F3...";
+        void this.host.reconnectGoogleDrive().then((ok) => {
+          if (ok) {
+            void this.refreshAll();
+          } else {
+            this.render();
+          }
+        });
+      });
     }
     if (this.activeTab === "note") {
       this.renderNoteTab(body, noteOccs);
@@ -3499,6 +3800,9 @@ var DriveEmbedderPlugin = class extends import_obsidian6.Plugin {
   openUploadModalFromManager() {
     this.openUploadModal(this.getActiveMarkdownEditor());
   }
+  reconnectGoogleDrive() {
+    return this.startOAuthFlow();
+  }
   triggerHydration() {
     this.hydrateDriveEmbeds(document.body);
   }
@@ -3557,7 +3861,7 @@ var DriveEmbedderPlugin = class extends import_obsidian6.Plugin {
             this.settings.googleAccessToken = tokens.accessToken;
             this.settings.googleRefreshToken = tokens.refreshToken;
             this.settings.tokenExpiresAt = tokens.expiresAt;
-            await this.saveSettings();
+            await this.saveData(this.settings);
           }
         });
         this.hydrateDriveEmbeds(document.body);
@@ -4124,6 +4428,10 @@ var DriveEmbedderPlugin = class extends import_obsidian6.Plugin {
             new import_obsidian6.Notice("\u{1F4CB} embed code copied to clipboard!");
           }
         })();
+      },
+      async () => {
+        const ok = await this.startOAuthFlow();
+        return ok ? this.uploader : null;
       }
     ).open();
   }
@@ -4143,11 +4451,17 @@ var DriveEmbedderSettingTab = class extends import_obsidian6.PluginSettingTab {
     this.createHelpSection(containerEl);
   }
   createConnectionSection(containerEl) {
+    var _a;
     const connectionDiv = containerEl.createDiv({ cls: "drive-embedder-connection-section" });
     const isConnected = this.plugin.isConnected();
     new import_obsidian6.Setting(connectionDiv).setName("Connection status").setHeading();
     const statusDiv = connectionDiv.createDiv({ cls: "connection-status" });
-    if (isConnected) {
+    if (isConnected && ((_a = this.plugin.getUploader()) == null ? void 0 : _a.isAuthExpired())) {
+      statusDiv.createSpan({
+        cls: "status-expired",
+        text: "\u26A0\uFE0F Google Drive session expired \u2014 click Reconnect below"
+      });
+    } else if (isConnected) {
       statusDiv.createSpan({ cls: "status-connected", text: "\u2705 connected to Google Drive" });
     } else {
       statusDiv.createSpan({ cls: "status-disconnected", text: "\u274C not connected" });

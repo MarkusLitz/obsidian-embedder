@@ -48,6 +48,11 @@ All notable changes to **Drive Embedder** are documented in this file.
   - Added `roadmap.md` containing a full security audit, data leak analysis, and prioritized remediation roadmap (`eface05`).
 
 ### Fixed & Security Hardening
+- **Binary Resumable Uploads & OAuth Expiry Recovery (`src/uploader.ts`, `src/google-oauth-flow.ts`, `src/upload-modal.ts`, `src/file-manager-view.ts`, `main.ts`, `styles.css`)**:
+  - Replaced Base64 `multipart/related` uploads with Google Drive **Resumable Uploads (`uploadType=resumable`)** sending raw binary `ArrayBuffer` payloads (single `PUT` up to 16 MiB, 8 MiB chunked `PUT`s with `Content-Range` for larger files), removing the 5 MB multipart limit and Base64 memory spike.
+  - Propagated real upload and Google API error messages to `UploadModal` instead of masking failures behind `"Failed to receive upload result."`.
+  - Added `GoogleAuthError` (`AUTH_EXPIRED`) detection on `invalid_grant` / `401` token refreshes, concurrent token refresh deduplication (`inflightTokenRefresh`), and one-click **`🔑 Reconnect & upload`** recovery directly inside `UploadModal`, `DriveFileManagerView`, and Settings.
+  - Prevented `onTokenRefresh` from recreating `GoogleDriveUploader` and wiping cached `blob:` URLs mid-session.
 - **OAuth Localhost Callback Server Lifecycle (`4ad9017`, `src/google-oauth-flow.ts`)**:
   - Fixed `EADDRINUSE` port conflicts on `127.0.0.1:8586` by adding `cancel()` and `cleanupServer()` with `srv.closeAllConnections()`, `srv.close()`, and `Connection: close` response headers.
   - Attached `server.on('error')` before `server.listen()` and delayed opening the external browser until the server is actively listening on `127.0.0.1`.

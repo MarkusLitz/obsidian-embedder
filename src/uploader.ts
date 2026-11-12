@@ -3,8 +3,9 @@
  * Handles file upload, permission setting, and token management
  */
 import { requestUrl, Notice } from 'obsidian';
-import { GoogleOAuthFlow } from './google-oauth-flow';
+import { GoogleOAuthFlow, GoogleAuthError, isAuthExpiredError } from './google-oauth-flow';
 import { OAuthTokens, DriveUploadResult, UploadProgress, DriveFileMetadata } from './types';
+import { getFileTypeInfo } from './size-presets';
 
 export interface GoogleDriveConfig {
     clientId: string;
@@ -20,11 +21,17 @@ export class GoogleDriveUploader {
     private readonly API_URL = 'https://www.googleapis.com/drive/v3';
     private readonly UPLOAD_URL = 'https://www.googleapis.com/upload/drive/v3';
     private readonly REDIRECT_PORT = 8586;
+    private readonly SINGLE_PUT_MAX_BYTES = 16 * 1024 * 1024; // 16 MiB
+    private readonly RESUMABLE_CHUNK_BYTES = 8 * 1024 * 1024; // 8 MiB (multiple of 256 KiB)
+    private readonly MAX_PRECACHE_BYTES = 50 * 1024 * 1024;   // 50 MiB
 
     private config: GoogleDriveConfig;
     private oauthFlow: GoogleOAuthFlow;
     private blobCache: Map<string, { blobUrl: string; mimeType: string; arrayBuffer?: ArrayBuffer }> = new Map();
     private inflightDownloads: Map<string, Promise<{ blobUrl: string; mimeType: string; arrayBuffer?: ArrayBuffer } | null>> = new Map();
+    private inflightTokenRefresh: Promise<string> | null = null;
+    private authExpired = false;
+    private hasShownAuthExpiredNotice = false;
 
     constructor(config: GoogleDriveConfig) {
         this.config = config;
@@ -33,6 +40,13 @@ export class GoogleDriveUploader {
             clientSecret: config.clientSecret,
             redirectPort: this.REDIRECT_PORT
         });
+    }
+
+    /**
+     * Whether the Google OAuth refresh token is known to be expired or revoked
+     */
+    isAuthExpired(): boolean {
+        return this.authExpired;
     }
 
     /**
@@ -150,125 +164,300 @@ export class GoogleDriveUploader {
     }
 
     /**
-     * Ensure we have a valid access token, refreshing if necessary
+     * Read a response header case-insensitively across Desktop (Electron) and Mobile WebViews
      */
-    private async ensureValidToken(): Promise<string> {
-        if (this.config.tokenExpiresAt && this.config.refreshToken) {
-            if (this.oauthFlow.isTokenExpired(this.config.tokenExpiresAt)) {
-                console.debug('Access token expired, refreshing...');
+    private getHeader(headers: Record<string, string> | undefined, name: string): string | undefined {
+        if (!headers) {
+            return undefined;
+        }
+        const target = name.toLowerCase();
+        for (const [key, value] of Object.entries(headers)) {
+            if (key.toLowerCase() === target) {
+                return value;
+            }
+        }
+        return undefined;
+    }
+
+    /**
+     * Extract a readable Google Drive API error message from a failed HTTP response
+     */
+    private parseGoogleApiError(status: number, responseText?: string): string {
+        if (responseText) {
+            try {
+                const parsed = JSON.parse(responseText) as {
+                    error?: { message?: string } | string;
+                    error_description?: string;
+                };
+                const detail =
+                    (typeof parsed.error === 'object' && parsed.error?.message) ||
+                    parsed.error_description ||
+                    (typeof parsed.error === 'string' ? parsed.error : '');
+                if (detail && detail.trim()) {
+                    return `Google Drive API error (${status}): ${detail.trim()}`;
+                }
+            } catch {
+                // Ignore non-JSON error body
+            }
+        }
+        return `Google Drive API error (HTTP ${status})`;
+    }
+
+    /**
+     * Ensure we have a valid access token, refreshing if necessary (with concurrent deduplication)
+     */
+    private async ensureValidToken(forceRefresh = false): Promise<string> {
+        const needsRefresh =
+            forceRefresh ||
+            (!this.config.accessToken && !!this.config.refreshToken) ||
+            (!!this.config.tokenExpiresAt && this.oauthFlow.isTokenExpired(this.config.tokenExpiresAt));
+
+        if (needsRefresh) {
+            if (!this.config.refreshToken) {
+                this.authExpired = true;
+                throw new GoogleAuthError(
+                    'Not connected to Google Drive (missing refresh token). Please reconnect in settings.',
+                    'AUTH_EXPIRED'
+                );
+            }
+
+            if (this.inflightTokenRefresh) {
+                return this.inflightTokenRefresh;
+            }
+
+            this.inflightTokenRefresh = (async () => {
+                console.debug('Access token expired or refresh requested, refreshing...');
                 try {
                     const newTokens = await this.oauthFlow.refreshAccessToken(this.config.refreshToken);
 
                     this.config.accessToken = newTokens.accessToken;
+                    this.config.refreshToken = newTokens.refreshToken;
                     this.config.tokenExpiresAt = newTokens.expiresAt;
+                    this.authExpired = false;
+                    this.hasShownAuthExpiredNotice = false;
 
                     if (this.config.onTokenRefresh) {
                         await this.config.onTokenRefresh(newTokens);
                     }
 
-                    new Notice('Google Drive token automatically refreshed');
+                    return this.config.accessToken;
                 } catch (error) {
                     console.error('Token refresh failed:', error);
-                    throw new Error('Token refresh failed. Please reconnect Google Drive.');
+                    if (isAuthExpiredError(error)) {
+                        this.authExpired = true;
+                        if (!this.hasShownAuthExpiredNotice) {
+                            this.hasShownAuthExpiredNotice = true;
+                            new Notice(
+                                '⚠️ Google Drive session expired. Please click "Reconnect" in Drive Embedder.',
+                                8000
+                            );
+                        }
+                        throw error;
+                    }
+                    const detail = error instanceof Error ? error.message : String(error);
+                    throw new Error(`Token refresh failed (${detail}). Please check your connection or reconnect Google Drive.`);
+                } finally {
+                    this.inflightTokenRefresh = null;
                 }
-            }
+            })();
+
+            return this.inflightTokenRefresh;
         }
 
         if (!this.config.accessToken) {
-            throw new Error('Not connected to Google Drive. Please connect first.');
+            throw new GoogleAuthError(
+                'Not connected to Google Drive. Please connect first.',
+                'AUTH_EXPIRED'
+            );
         }
 
         return this.config.accessToken;
     }
 
     /**
-     * Upload a file to Google Drive with progress callback
+     * Upload a file to Google Drive via binary resumable upload (no 5 MB multipart limit or Base64 overhead)
      */
     async uploadFile(
         file: File,
         folderPath: string,
         onProgress?: (progress: UploadProgress) => void
-    ): Promise<DriveUploadResult | null> {
+    ): Promise<DriveUploadResult> {
         try {
-            // Stage 1: Preparing
+            // Stage 1: Preparing & validating token
             onProgress?.({
                 stage: 'preparing',
                 message: 'Preparing upload...',
                 progress: 10
             });
 
-            const accessToken = await this.ensureValidToken();
+            let accessToken = await this.ensureValidToken();
 
-            // Find or create folder
+            // Resolve a valid MIME type (fallback if OS/mobile picker omits file.type)
+            const resolvedMimeType = (
+                file.type ||
+                getFileTypeInfo(file.name)?.mimeType ||
+                'application/octet-stream'
+            ).split(';')[0].trim() || 'application/octet-stream';
+
+            // Find or create destination folder
             const folderId = await this.ensureFolder(folderPath);
 
-            // Read file as ArrayBuffer
-            const arrayBuffer = await file.arrayBuffer();
-            const base64Content = this.arrayBufferToBase64(arrayBuffer);
-
-            // Stage 2: Uploading
+            // Stage 2: Initiate Google Drive Resumable Upload session
             onProgress?.({
                 stage: 'uploading',
-                message: 'Uploading to Google Drive...',
-                progress: 30
+                message: 'Initializing upload session...',
+                progress: 20
             });
 
-            // Create file metadata
+            const totalBytes = file.size;
             const metadata = {
                 name: file.name,
-                mimeType: file.type,
+                mimeType: resolvedMimeType,
                 parents: [folderId]
             };
 
-            // Upload using multipart
-            const boundary = '-------314159265358979323846';
-            const delimiter = `\r\n--${boundary}\r\n`;
-            const closeDelimiter = `\r\n--${boundary}--`;
-
-            const multipartBody =
-                delimiter +
-                'Content-Type: application/json\r\n\r\n' +
-                JSON.stringify(metadata) +
-                delimiter +
-                `Content-Type: ${file.type}\r\n` +
-                'Content-Transfer-Encoding: base64\r\n\r\n' +
-                base64Content +
-                closeDelimiter;
-
-            const uploadResponse = await requestUrl({
-                url: `${this.UPLOAD_URL}/files?uploadType=multipart&fields=id,webViewLink,webContentLink,name,mimeType`,
-                method: 'POST',
-                headers: {
-                    'Authorization': `Bearer ${accessToken}`,
-                    'Content-Type': `multipart/related; boundary=${boundary}`
-                },
-                body: multipartBody
-            });
-
-            if (uploadResponse.status !== 200) {
-                throw new Error(`Upload failed: ${uploadResponse.status}`);
-            }
-
-            const fileData = uploadResponse.json;
-            const fileId = fileData.id;
-
-            // Pre-cache local Blob URL so private embed renders immediately without extra download
-            try {
-                const normalizedMime = (file.type || 'application/octet-stream').toLowerCase();
-                const localBlob = new Blob([arrayBuffer], { type: normalizedMime });
-                this.blobCache.set(fileId, {
-                    blobUrl: URL.createObjectURL(localBlob),
-                    mimeType: normalizedMime,
-                    arrayBuffer: normalizedMime === 'application/pdf' ? arrayBuffer : undefined
+            const initiateSession = (token: string) =>
+                requestUrl({
+                    url: `${this.UPLOAD_URL}/files?uploadType=resumable&fields=id,webViewLink,webContentLink,name,mimeType`,
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${token}`,
+                        'Content-Type': 'application/json; charset=UTF-8',
+                        'X-Upload-Content-Type': resolvedMimeType,
+                        'X-Upload-Content-Length': String(totalBytes)
+                    },
+                    body: JSON.stringify(metadata),
+                    throw: false
                 });
-            } catch (cacheErr) {
-                console.debug('Could not pre-cache blob URL:', cacheErr);
+
+            let initResponse = await initiateSession(accessToken);
+            if (initResponse.status === 401 && this.config.refreshToken) {
+                accessToken = await this.ensureValidToken(true);
+                initResponse = await initiateSession(accessToken);
             }
 
-            // Get updated file info (file remains private to the owner's Google account)
-            const fileInfo = await this.getFileInfo(fileId);
+            if (initResponse.status !== 200) {
+                throw new Error(this.parseGoogleApiError(initResponse.status, initResponse.text));
+            }
 
-            // Stage 3: Complete
+            const sessionUri = this.getHeader(initResponse.headers, 'location');
+            if (!sessionUri) {
+                throw new Error('Google Drive did not return a resumable upload session URL.');
+            }
+
+            // Stage 3: Send binary file bytes (single PUT up to 16 MiB, 8 MiB chunked PUTs for larger files)
+            let fileData: {
+                id?: string;
+                webViewLink?: string;
+                webContentLink?: string;
+                name?: string;
+                mimeType?: string;
+            } | null = null;
+            let fullBufferForCache: ArrayBuffer | undefined;
+
+            if (totalBytes <= this.SINGLE_PUT_MAX_BYTES) {
+                const arrayBuffer = await file.arrayBuffer();
+                onProgress?.({
+                    stage: 'uploading',
+                    message: 'Uploading to Google Drive...',
+                    progress: 45
+                });
+
+                const uploadResponse = await requestUrl({
+                    url: sessionUri,
+                    method: 'PUT',
+                    contentType: resolvedMimeType,
+                    body: arrayBuffer,
+                    throw: false
+                });
+
+                if (uploadResponse.status !== 200 && uploadResponse.status !== 201) {
+                    throw new Error(this.parseGoogleApiError(uploadResponse.status, uploadResponse.text));
+                }
+
+                fileData = JSON.parse(uploadResponse.text);
+                fullBufferForCache = arrayBuffer;
+            } else {
+                let offset = 0;
+                while (offset < totalBytes) {
+                    const end = Math.min(offset + this.RESUMABLE_CHUNK_BYTES, totalBytes);
+                    const chunkBuffer = await file.slice(offset, end).arrayBuffer();
+                    const pct = Math.round((offset / totalBytes) * 100);
+
+                    onProgress?.({
+                        stage: 'uploading',
+                        message: `Uploading to Google Drive (${pct}%)...`,
+                        progress: 25 + Math.round((offset / totalBytes) * 65)
+                    });
+
+                    const chunkResponse = await requestUrl({
+                        url: sessionUri,
+                        method: 'PUT',
+                        contentType: resolvedMimeType,
+                        headers: {
+                            'Content-Range': `bytes ${offset}-${end - 1}/${totalBytes}`
+                        },
+                        body: chunkBuffer,
+                        throw: false
+                    });
+
+                    if (end < totalBytes) {
+                        if (
+                            chunkResponse.status !== 308 &&
+                            chunkResponse.status !== 200 &&
+                            chunkResponse.status !== 201
+                        ) {
+                            throw new Error(this.parseGoogleApiError(chunkResponse.status, chunkResponse.text));
+                        }
+                        if (chunkResponse.status === 200 || chunkResponse.status === 201) {
+                            fileData = JSON.parse(chunkResponse.text);
+                            break;
+                        }
+                        const rangeHeader = this.getHeader(chunkResponse.headers, 'range');
+                        const rangeMatch = rangeHeader ? rangeHeader.match(/bytes=0-(\d+)/i) : null;
+                        offset = rangeMatch && rangeMatch[1] ? parseInt(rangeMatch[1], 10) + 1 : end;
+                    } else {
+                        if (chunkResponse.status !== 200 && chunkResponse.status !== 201) {
+                            throw new Error(this.parseGoogleApiError(chunkResponse.status, chunkResponse.text));
+                        }
+                        fileData = JSON.parse(chunkResponse.text);
+                        offset = end;
+                    }
+                }
+            }
+
+            const fileId = fileData?.id;
+            if (!fileId) {
+                throw new Error('Google Drive upload completed without returning a file ID.');
+            }
+
+            // Pre-cache local Blob URL so private embed renders immediately without re-downloading
+            if (totalBytes <= this.MAX_PRECACHE_BYTES) {
+                try {
+                    const normalizedMime = resolvedMimeType.toLowerCase();
+                    const localBlob = fullBufferForCache
+                        ? new Blob([fullBufferForCache], { type: normalizedMime })
+                        : new Blob([file], { type: normalizedMime });
+                    this.blobCache.set(fileId, {
+                        blobUrl: URL.createObjectURL(localBlob),
+                        mimeType: normalizedMime,
+                        arrayBuffer: normalizedMime === 'application/pdf' ? fullBufferForCache : undefined
+                    });
+                } catch (cacheErr) {
+                    console.debug('Could not pre-cache blob URL:', cacheErr);
+                }
+            }
+
+            // Use links returned directly from upload response, falling back to getFileInfo only if omitted
+            let webViewLink = fileData?.webViewLink;
+            let webContentLink = fileData?.webContentLink;
+            if (!webViewLink) {
+                const fileInfo = await this.getFileInfo(fileId);
+                webViewLink = fileInfo.webViewLink;
+                webContentLink = webContentLink || fileInfo.webContentLink;
+            }
+
+            // Stage 4: Complete
             onProgress?.({
                 stage: 'complete',
                 message: 'Upload complete!',
@@ -277,10 +466,10 @@ export class GoogleDriveUploader {
 
             return {
                 fileId: fileId,
-                webViewLink: fileInfo.webViewLink || `https://drive.google.com/file/d/${fileId}/view`,
-                webContentLink: fileInfo.webContentLink || `https://drive.google.com/uc?export=view&id=${fileId}`,
+                webViewLink: webViewLink || `https://drive.google.com/file/d/${fileId}/view`,
+                webContentLink: webContentLink || `https://drive.google.com/uc?export=view&id=${fileId}`,
                 fileName: file.name,
-                mimeType: file.type
+                mimeType: resolvedMimeType
             };
 
         } catch (error) {
@@ -292,7 +481,7 @@ export class GoogleDriveUploader {
                 progress: 0,
                 error: message
             });
-            return null;
+            throw error instanceof Error ? error : new Error(message);
         }
     }
 
@@ -483,30 +672,42 @@ export class GoogleDriveUploader {
      * Find a folder by name
      */
     private async findFolder(name: string, parentId: string): Promise<string | null> {
-        try {
-            const accessToken = await this.ensureValidToken();
-            const safeName = name.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-            const safeParentId = parentId.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-            const query = `name='${safeName}' and '${safeParentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`;
+        let accessToken = await this.ensureValidToken();
+        const safeName = name.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+        const safeParentId = parentId.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+        const query = `name='${safeName}' and '${safeParentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`;
+        const url = `${this.API_URL}/files?q=${encodeURIComponent(query)}&fields=files(id)`;
 
-            const response = await requestUrl({
-                url: `${this.API_URL}/files?q=${encodeURIComponent(query)}&fields=files(id)`,
+        let response = await requestUrl({
+            url,
+            method: 'GET',
+            headers: {
+                'Authorization': `Bearer ${accessToken}`
+            },
+            throw: false
+        });
+
+        if (response.status === 401 && this.config.refreshToken) {
+            accessToken = await this.ensureValidToken(true);
+            response = await requestUrl({
+                url,
                 method: 'GET',
                 headers: {
                     'Authorization': `Bearer ${accessToken}`
-                }
+                },
+                throw: false
             });
-
-            if (response.status === 200) {
-                const data = response.json;
-                if (data.files && data.files.length > 0) {
-                    return data.files[0].id;
-                }
-            }
-            return null;
-        } catch (error) {
-            return null;
         }
+
+        if (response.status !== 200) {
+            throw new Error(this.parseGoogleApiError(response.status, response.text));
+        }
+
+        const data = JSON.parse(response.text);
+        if (data.files && data.files.length > 0) {
+            return data.files[0].id;
+        }
+        return null;
     }
 
     /**
@@ -528,14 +729,15 @@ export class GoogleDriveUploader {
                 'Authorization': `Bearer ${accessToken}`,
                 'Content-Type': 'application/json'
             },
-            body: JSON.stringify(metadata)
+            body: JSON.stringify(metadata),
+            throw: false
         });
 
         if (response.status !== 200) {
-            throw new Error(`Folder creation failed: ${response.status}`);
+            throw new Error(this.parseGoogleApiError(response.status, response.text));
         }
 
-        return response.json.id;
+        return JSON.parse(response.text).id;
     }
 
     /**
@@ -594,17 +796,7 @@ export class GoogleDriveUploader {
         this.config.accessToken = '';
         this.config.refreshToken = '';
         this.config.tokenExpiresAt = 0;
-    }
-
-    /**
-     * Convert ArrayBuffer to base64
-     */
-    private arrayBufferToBase64(buffer: ArrayBuffer): string {
-        const bytes = new Uint8Array(buffer);
-        let binary = '';
-        for (let i = 0; i < bytes.length; i++) {
-            binary += String.fromCharCode(bytes[i]);
-        }
-        return btoa(binary);
+        this.authExpired = false;
+        this.hasShownAuthExpiredNotice = false;
     }
 }

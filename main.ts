@@ -160,6 +160,10 @@ export default class DriveEmbedderPlugin extends Plugin implements DriveManagerP
         this.openUploadModal(this.getActiveMarkdownEditor());
     }
 
+    reconnectGoogleDrive(): Promise<boolean> {
+        return this.startOAuthFlow();
+    }
+
     triggerHydration(): void {
         this.hydrateDriveEmbeds(document.body);
     }
@@ -224,7 +228,7 @@ export default class DriveEmbedderPlugin extends Plugin implements DriveManagerP
                         this.settings.googleAccessToken = tokens.accessToken;
                         this.settings.googleRefreshToken = tokens.refreshToken;
                         this.settings.tokenExpiresAt = tokens.expiresAt;
-                        await this.saveSettings();
+                        await this.saveData(this.settings);
                     }
                 });
                 this.hydrateDriveEmbeds(document.body);
@@ -890,6 +894,10 @@ export default class DriveEmbedderPlugin extends Plugin implements DriveManagerP
                         new Notice('📋 embed code copied to clipboard!');
                     }
                 })();
+            },
+            async () => {
+                const ok = await this.startOAuthFlow();
+                return ok ? this.uploader : null;
             }
         ).open();
     }
@@ -935,7 +943,12 @@ class DriveEmbedderSettingTab extends PluginSettingTab {
             .setHeading();
 
         const statusDiv = connectionDiv.createDiv({ cls: 'connection-status' });
-        if (isConnected) {
+        if (isConnected && this.plugin.getUploader()?.isAuthExpired()) {
+            statusDiv.createSpan({
+                cls: 'status-expired',
+                text: '⚠️ Google Drive session expired — click Reconnect below'
+            });
+        } else if (isConnected) {
             statusDiv.createSpan({ cls: 'status-connected', text: '✅ connected to Google Drive' });
         } else {
             statusDiv.createSpan({ cls: 'status-disconnected', text: '❌ not connected' });

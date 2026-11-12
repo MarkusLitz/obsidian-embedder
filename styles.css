@@ -20,6 +20,22 @@
     font-size: 0.9em;
 }
 
+.drive-auth-expired-banner {
+    padding: 10px 14px;
+    margin-bottom: 16px;
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--text-warning, #f59e0b) 15%, var(--background-secondary));
+    border: 1px solid color-mix(in srgb, var(--text-warning, #f59e0b) 45%, transparent);
+    color: var(--text-normal);
+    font-size: 0.88em;
+    line-height: 1.4;
+}
+
+.drive-auth-expired-banner.hidden,
+.drive-embedder-btn.hidden {
+    display: none;
+}
+
 /* File Input Section */
 .drive-embedder-section {
     margin-bottom: 20px;
@@ -481,6 +497,11 @@
 
 .status-connected {
     color: var(--interactive-success, #4ade80);
+    font-weight: 600;
+}
+
+.status-expired {
+    color: var(--text-warning, #f59e0b);
     font-weight: 600;
 }
 

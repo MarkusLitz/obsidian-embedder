@@ -7,6 +7,7 @@ import { Modal, App, Notice, Setting } from 'obsidian';
 import { ContentCategory, SizeOption, UploadProgress, DriveUploadResult, EmbedOptions } from './types';
 import { getFileTypeInfo, getSizePresets, getRecommendedSize, SUPPORTED_EXTENSIONS } from './size-presets';
 import { GoogleDriveUploader } from './uploader';
+import { isAuthExpiredError } from './google-oauth-flow';
 
 export interface UploadModalResult {
     file: File;
@@ -29,16 +30,20 @@ export class UploadModal extends Modal {
     private uploader: GoogleDriveUploader;
     private driveFolder: string;
     private onComplete: (results: UploadModalResult[]) => void;
+    private onReconnect?: () => Promise<GoogleDriveUploader | null>;
 
     private queuedItems: QueuedUploadItem[] = [];
     private showTitle: boolean = true;
     private isUploading: boolean = false;
+    private authExpired: boolean = false;
 
     // UI Elements
+    private authBannerEl: HTMLElement | null = null;
     private fileInputEl: HTMLInputElement | null = null;
     private fileInfoEl: HTMLElement | null = null;
     private sizeOptionsEl: HTMLElement | null = null;
     private progressEl: HTMLElement | null = null;
+    private reconnectBtn: HTMLButtonElement | null = null;
     private uploadBtn: HTMLButtonElement | null = null;
 
     // Progress UI Elements
@@ -51,13 +56,16 @@ export class UploadModal extends Modal {
         uploader: GoogleDriveUploader,
         driveFolder: string,
         defaultShowTitle: boolean,
-        onComplete: (results: UploadModalResult[]) => void
+        onComplete: (results: UploadModalResult[]) => void,
+        onReconnect?: () => Promise<GoogleDriveUploader | null>
     ) {
         super(app);
         this.uploader = uploader;
         this.driveFolder = driveFolder;
         this.showTitle = defaultShowTitle;
         this.onComplete = onComplete;
+        this.onReconnect = onReconnect;
+        this.authExpired = uploader.isAuthExpired();
     }
 
     onOpen() {
@@ -74,6 +82,12 @@ export class UploadModal extends Modal {
         contentEl.createEl('p', {
             text: 'upload one or multiple files to Google Drive and insert embeds.',
             cls: 'drive-embedder-subtitle'
+        });
+
+        // Auth Expired Warning Banner (hidden unless session expired)
+        this.authBannerEl = contentEl.createDiv({ cls: 'drive-auth-expired-banner hidden' });
+        this.authBannerEl.createSpan({
+            text: '⚠️ Google Drive session expired (refresh token expired or revoked). Click "Reconnect" below to sign in again.'
         });
 
         // File Selection Section
@@ -93,6 +107,7 @@ export class UploadModal extends Modal {
 
         // Action Buttons
         this.createActionButtons(contentEl);
+        this.updateUploadButtonState();
 
         // Supported formats info
         this.createSupportedFormatsInfo(contentEl);
@@ -209,8 +224,34 @@ export class UploadModal extends Modal {
     }
 
     private updateUploadButtonState() {
-        if (!this.uploadBtn) return;
         const count = this.queuedItems.length;
+
+        if (this.authBannerEl) {
+            if (this.authExpired) {
+                this.authBannerEl.removeClass('hidden');
+            } else {
+                this.authBannerEl.addClass('hidden');
+            }
+        }
+
+        if (this.reconnectBtn && this.onReconnect) {
+            if (this.authExpired) {
+                this.reconnectBtn.removeClass('hidden');
+                this.reconnectBtn.disabled = this.isUploading;
+                this.reconnectBtn.textContent =
+                    count > 0 ? '🔑 Reconnect & upload' : '🔑 Reconnect Google Drive';
+                if (this.uploadBtn) {
+                    this.uploadBtn.addClass('hidden');
+                }
+                return;
+            } else {
+                this.reconnectBtn.addClass('hidden');
+            }
+        }
+
+        if (!this.uploadBtn) return;
+        this.uploadBtn.removeClass('hidden');
+
         if (count === 0) {
             this.uploadBtn.disabled = true;
             this.uploadBtn.textContent = '📤 upload and embed';
@@ -453,6 +494,17 @@ export class UploadModal extends Modal {
         });
         cancelBtn.addEventListener('click', () => this.close());
 
+        // Reconnect & Upload button (shown when Google OAuth session expired)
+        if (this.onReconnect) {
+            this.reconnectBtn = buttonContainer.createEl('button', {
+                text: '🔑 Reconnect & upload',
+                cls: 'drive-embedder-btn primary hidden'
+            });
+            this.reconnectBtn.addEventListener('click', () => {
+                void this.handleReconnectAndUpload();
+            });
+        }
+
         // Upload button
         this.uploadBtn = buttonContainer.createEl('button', {
             text: '📤 upload and embed',
@@ -460,6 +512,39 @@ export class UploadModal extends Modal {
         });
         this.uploadBtn.disabled = true;
         this.uploadBtn.addEventListener('click', () => { void this.handleUpload(); });
+    }
+
+    private async handleReconnectAndUpload() {
+        if (!this.onReconnect || this.isUploading) {
+            return;
+        }
+        if (this.reconnectBtn) {
+            this.reconnectBtn.disabled = true;
+            this.reconnectBtn.textContent = '🔑 Waiting for browser login...';
+        }
+        try {
+            const freshUploader = await this.onReconnect();
+            if (freshUploader) {
+                this.uploader = freshUploader;
+                this.authExpired = false;
+                for (const item of this.queuedItems) {
+                    if (item.status === 'error') {
+                        item.status = 'pending';
+                        item.errorMessage = undefined;
+                    }
+                }
+                this.refreshQueueAndSizeUI();
+                if (this.queuedItems.length > 0) {
+                    await this.handleUpload();
+                }
+                return;
+            }
+        } finally {
+            if (this.reconnectBtn) {
+                this.reconnectBtn.disabled = false;
+            }
+            this.updateUploadButtonState();
+        }
     }
 
     private createSupportedFormatsInfo(container: HTMLElement) {
@@ -521,10 +606,6 @@ export class UploadModal extends Modal {
                     }
                 );
 
-                if (!result) {
-                    throw new Error('Failed to receive upload result.');
-                }
-
                 item.status = 'done';
                 finishedCount++;
                 completedResults.push({
@@ -542,6 +623,18 @@ export class UploadModal extends Modal {
                 item.status = 'error';
                 item.errorMessage = message;
                 finishedCount++;
+
+                if (isAuthExpiredError(error)) {
+                    this.authExpired = true;
+                    // Mark remaining queued items without hammering the token endpoint repeatedly
+                    for (let j = i + 1; j < this.queuedItems.length; j++) {
+                        this.queuedItems[j].status = 'error';
+                        this.queuedItems[j].errorMessage = message;
+                    }
+                    this.updateFileInfo();
+                    break;
+                }
+
                 this.updateFileInfo();
             }
         }
@@ -566,14 +659,19 @@ export class UploadModal extends Modal {
             this.queuedItems = failedItems;
             this.hideProgress();
             this.refreshQueueAndSizeUI();
-            if (this.uploadBtn) {
+            if (!this.authExpired && this.uploadBtn) {
                 this.uploadBtn.textContent = `🔄 retry failed (${failedItems.length})`;
             }
-            new Notice(
-                completedResults.length > 0
-                    ? `⚠️ ${completedResults.length} uploaded, ${failedItems.length} failed. You can retry the failed files.`
-                    : `❌ upload failed for ${failedItems.length} file(s).`
-            );
+            if (this.authExpired) {
+                new Notice('⚠️ Google Drive session expired. Click "Reconnect & upload" to sign in again.');
+            } else {
+                const firstError = failedItems[0]?.errorMessage || 'Unknown error';
+                new Notice(
+                    completedResults.length > 0
+                        ? `⚠️ ${completedResults.length} uploaded, ${failedItems.length} failed: ${firstError}`
+                        : `❌ upload failed: ${firstError}`
+                );
+            }
         }
     }
 
