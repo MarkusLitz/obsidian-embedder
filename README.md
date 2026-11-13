@@ -1,203 +1,169 @@
 # Drive Embedder
 
-Upload local files to Google Drive and embed them directly in your Obsidian notes with intuitive size options and full privacy.
+Upload private files to Google Drive, render authenticated media and PDF.js embeds on Desktop & Android, manage uploaded Drive files across your vault, and turn Google Drive/Docs links into interactive Smart Chips.
+
+- **Plugin ID:** `mlitz-drive-embedder`
+- **Version:** `2.0.0` (Obsidian `1.5.0+`, Desktop & Mobile/Android)
+
+---
 
 ## Features
 
-- 🚀 **One-Click Upload**: Upload files directly to Google Drive from Obsidian (via ribbon icon or command palette)
-- 🔒 **Strictly Private Uploads**: Uploaded files stay private in your Google Drive (no public link sharing required)
-- 🖼️ **Authenticated Live Rendering**: Private Google Drive images, videos, audio files, and PDFs are automatically fetched via authenticated API calls and rendered in Reading View and Live Preview using local Blob URLs
-- 🔗 **Auto Link & Embed Generation**: Always inserts a clickable Markdown link (`[📁 filename](...)`) alongside the media embed at your cursor position (or copies to clipboard if no note is active)
-- 📱 **Desktop & Android Support**: Works on Desktop (macOS, Windows, Linux) and Android/mobile
-- 📐 **Intuitive Size Options**: Clear size presets tailored for Video, Documents, Audio, and Images
-- 📂 **Multi-Format Support**: Video (MP4, WebM, MOV, AVI), Audio (MP3, WAV, OGG, M4A), PDF, Images (JPG, JPEG, PNG, GIF, WebP, SVG)
-- 🔄 **Real-Time Progress**: Visual upload progress tracking
+- 🔒 **Strictly Private Google Drive Uploads**: Uploaded files remain private in your own Google Drive — no `anyone with link` sharing permissions are ever added.
+- 🚀 **Multi-File Binary Resumable Uploads**: Drag & drop or pick single or multiple files at once with per-file and global size presets, batch progress tracking, partial-failure retry, and Google Drive **Resumable Uploads** (`uploadType=resumable`, no 5 MB multipart ceiling or Base64 memory overhead).
+- 🖼️ **Authenticated Live Rendering (Desktop & Android)**:
+  - **Images** (`JPG`, `JPEG`, `PNG`, `GIF`, `WebP`, `SVG`) → hydrated via authenticated local `blob:` URLs.
+  - **Video** (`MP4`, `WebM`, `MOV`, `AVI`) → rendered as native HTML5 `<video controls>` players.
+  - **Audio** (`MP3`, `WAV`, `OGG`, `M4A`) → rendered as native HTML5 `<audio controls>` players.
+  - **PDF Documents** (`PDF`) → rendered via Obsidian's built-in **PDF.js `<canvas>` viewer** (`loadPdfJs()`) with HiDPI scaling, zoom controls (`−` / `100%` / `+`), page counter, and viewport-virtualization recovery so any number of private PDFs render reliably in Reading View and Live Preview on both Desktop and Android.
+- ✨ **Google Smart Chips**: Automatically transforms pasted Google Drive, Docs, Sheets, Slides, Forms, Drawings, and Folder URLs into named Markdown links (`[Document Title](url)`) and renders them with Google-style icons in both Reading View and CodeMirror 6 Live Preview.
+- 🗂️ **Drive File Manager Sidebar**: Dockable `Drive files` view (`hard-drive` ribbon icon) with:
+  - **📄 Current note tab**: Inspect embeds in the active note, live-resize embeds in place, jump to lines, or delete embeds & move files to Google Drive trash.
+  - **🌍 All Drive files tab**: Browse files in your Drive upload folder cross-referenced against all vault notes, filter `Used` vs. `⚠️ Unused` (orphaned) files, re-embed existing files in one click, or bulk-trash unused files.
+- 🗑️ **Desktop Hover Delete**: Hover over any embedded Drive media on Desktop to cleanly remove the link + embed block from the note and optionally move the file to Google Drive trash (automatically hidden on mobile/touch devices).
+- 🔑 **One-Click OAuth Session Recovery**: Detects expired/revoked refresh tokens and provides a direct **`🔑 Reconnect & upload`** action inside the Upload Modal, File Manager sidebar, and Settings.
 
-## Installation via BRAT
+---
 
-1. Install [BRAT](https://github.com/TfTHacker/obsidian42-brat) plugin
-2. Open Obsidian Settings → BRAT → Add Beta plugin
-3. Enter this repository URL: `MarkusLitz/obsidian-embedder` (or upstream `reallygood83/obsidian-embedder`)
-4. Click "Add Plugin"
-5. Enable "Drive Embedder" in Settings → Community plugins
+## Installation
+
+### Option 1: Via BRAT
+1. Install the [BRAT](https://github.com/TfTHacker/obsidian42-brat) plugin in Obsidian.
+2. Open **Settings → BRAT → Add Beta plugin**.
+3. Enter repository: `MarkusLitz/obsidian-embedder`.
+4. Click **Add Plugin**, then enable **Drive Embedder** under **Settings → Community plugins**.
+
+### Option 2: Manual / Git Clone
+Clone or copy `main.js`, `manifest.json`, and `styles.css` into your vault under:
+```text
+<Vault>/.obsidian/plugins/mlitz-drive-embedder/
+```
+Then reload Obsidian and enable **Drive Embedder** in **Settings → Community plugins**.
+
+---
 
 ## Google OAuth Setup
 
-Before using the plugin, you need to set up Google OAuth credentials:
+### 1. Create a Google Cloud Project & Enable API
+1. Open [Google Cloud Console](https://console.cloud.google.com).
+2. Create a new project (or select an existing one).
+3. Go to **APIs & Services → Library**, search for **Google Drive API**, and click **Enable**.
 
-### 1. Create Google Cloud Project
-
-1. Go to [Google Cloud Console](https://console.cloud.google.com)
-2. Create a new project or select an existing one
-3. Enable **Google Drive API**:
-   - Navigate to "APIs & Services" → "Library"
-   - Search for "Google Drive API"
-   - Click "Enable"
-
-### 2. Configure OAuth Consent Screen
-
-1. Go to "APIs & Services" → "OAuth consent screen"
-2. Select "External" user type
-3. Fill in required fields:
-   - App name: "Drive Embedder"
-   - User support email: Your email
-   - Developer contact: Your email
-4. Add scopes:
-   - `https://www.googleapis.com/auth/drive.file`
+### 2. Configure the OAuth Consent Screen
+1. Go to **APIs & Services → OAuth consent screen** (or **Google Auth Platform → Branding / Audience**).
+2. Choose **External** user type and fill in the required app name (`Drive Embedder`) and your email address.
+3. Add the following scopes under **Data Access / Scopes**:
+   - `https://www.googleapis.com/auth/drive.file` *(upload, read, and trash files created by the plugin)*
+   - `https://www.googleapis.com/auth/drive.metadata.readonly` *(resolve titles of private Google Docs/Sheets/Slides/Drive files for Smart Chips)*
    - `https://www.googleapis.com/auth/userinfo.email`
-5. Save and continue
+4. **Important — Prevent 7-Day Token Expiration:**
+   - If your app's Publishing status is left in **Testing**, Google automatically expires OAuth refresh tokens every **7 days**.
+   - Switch Publishing status to **In production** (for personal use with your own Google account, you do **not** need to submit the app for Google verification — simply click *Advanced → Go to Drive Embedder (unsafe)* once during browser login). Your refresh token will then remain valid permanently.
 
-### 3. Create OAuth Credentials
+### 3. Create Desktop OAuth Credentials
+1. Go to **APIs & Services → Credentials → Create Credentials → OAuth client ID**.
+2. Select Application type: **Desktop app**.
+3. Copy the generated **Client ID** and **Client secret**.
 
-1. Go to "APIs & Services" → "Credentials"
-2. Click "Create Credentials" → "OAuth Client ID"
-3. Application type: **Desktop app**
-4. Name: "Drive Embedder"
-5. Click "Create"
-6. Copy the **Client ID** and **Client Secret**
+### 4. Connect in Obsidian
+1. Open **Obsidian Settings → Drive Embedder**.
+2. Paste your **Client ID** and **Client secret**.
+3. Click **Connect** (or **Reconnect** to grant updated scopes).
+4. Complete the Google sign-in in your browser (uses PKCE `S256` with a temporary local callback listener on `127.0.0.1:8586` / `http://localhost:8586/callback`).
 
-### 4. Configure Plugin
+> **Android / Mobile Note:** Perform the initial OAuth login on Desktop (`macOS`, `Windows`, or `Linux`). Once connected, your synced tokens in `.obsidian/plugins/mlitz-drive-embedder/data.json` work seamlessly on Android as well.
 
-1. Open Obsidian Settings → Drive Embedder
-2. Paste your **Client ID**
-3. Paste your **Client secret**
-4. Click **Connect**
-5. Complete the browser authorization flow (uses PKCE and local callback on `http://127.0.0.1:8586/callback`)
-6. Grant permissions to your Google Drive
-
-> **Note for Android / Mobile:** Perform the initial OAuth login on Desktop (macOS/Windows/Linux). Once connected, your synced tokens in `data.json` work seamlessly on Android as well.
+---
 
 ## Usage
 
-### Upload and Embed Files
+### 1. Upload & Embed Files (Single or Batch)
+1. Click the cloud upload ribbon icon (**`Drive Embedder: upload file`**) or run **`Drive Embedder: upload file and embed`** from the Command Palette.
+2. Drag & drop one or multiple files into the modal, or click **select files**.
+3. Adjust embed sizes per file in the queue or apply a global preset across all queued files, and toggle **Show filename** if desired.
+4. Click **📤 upload and embed**.
+5. For each file, a clickable Markdown link (`[📁 filename](https://drive.google.com/file/d/<id>/view)`) and the responsive HTML embed block are inserted at your cursor position in a single undoable step (or copied to your clipboard if no Markdown note is open).
 
-1. Click the cloud upload icon in the ribbon (`Drive Embedder: upload file`), or
-2. Use the command palette: `Drive Embedder: upload file and embed`
-3. Drag & drop a file or click **select file**
-4. Choose your preferred embed size and whether to highlight the filename
-5. Click **upload and embed**
-6. A clickable Google Drive link and the embed code are automatically inserted at your cursor position (or copied to your clipboard if no Markdown editor is open)
+### 2. Google Smart Chips
+- **Paste raw URLs:** Paste any `https://docs.google.com/...`, `https://drive.google.com/...`, or `https://forms.gle/...` URL into a Markdown note. Drive Embedder inserts an instant `⏳` placeholder chip, resolves the document's real title (via Clipboard HTML → Drive API v3 → Vault scan → page `<title>`), and formats it as `[Document Title](url)`.
+- **Paste over selected text:** Select text in the editor and paste a Google URL to turn your selection directly into a Smart Chip.
+- **Convert existing URLs in a note:** Run **`Drive Embedder: convert Google Drive/Docs URLs in note to smart chips`** from the Command Palette.
+- **Supported chip icons:** Google Docs, Sheets, Slides, Forms, Drawings, Drive Folders, PDFs, and generic Drive files. Moving your cursor into a chip in Live Preview automatically unfolds the underlying Markdown syntax for editing.
 
-### Size Options
+### 3. Manage Files & Resize/Delete Embeds
+Click the hard-drive ribbon icon (**`Drive Embedder: manage files`**) or run **`Drive Embedder: manage uploaded Drive files`**:
+- **📄 Current note tab:**
+  - View all Google Drive embeds and inline Drive links in the active note with line numbers, file sizes, cached image thumbnails, and vault-wide usage counts (`🔗 N× in vault`).
+  - Change an embed's size preset via the **`📐 Size`** dropdown to update the note's Markdown and live DOM immediately.
+  - Click **`📍 Jump`** to scroll to the embed, **`🌐 Drive`** to open it in Google Drive, or **`🗑️ Delete`** to remove the embed block and optionally move the file to your Google Drive trash (recoverable for 30 days).
+- **🌍 All Drive files tab:**
+  - Lists all non-trashed files inside your configured Drive upload folder (`Obsidian/DriveEmbedder`) and cross-references them against every Markdown note in your vault.
+  - Filter by **`All`**, **`Used`**, or **`⚠️ Unused`**, filter by media category, search by filename or note name, click **`➕ Embed`** to insert an existing Drive file into the active note without re-uploading, or click **`🧹 Trash unused`** to clean up orphaned Drive files in bulk.
 
-#### Video
-- 🔹 **Compact**: `60%` width × `280px` height (good for inline content)
-- 🔸 **Medium**: `80%` width × `400px` height *(recommended)*
-- 🔶 **Large**: `100%` width × `500px` height
-- 🟠 **Full width**: `100%` width × `600px` height
+---
 
-#### Documents (PDF)
-- 🔹 **Compact**: `70%` width × `400px` height (quick preview)
-- 🔸 **Medium**: `100%` width × `500px` height *(recommended)*
-- 🔶 **Large**: `100%` width × `650px` height
-- 🟠 **Full screen**: `100%` width × `800px` height
+## Size Presets & Supported Formats
 
-#### Audio
-- 🎵 **Slim**: `100%` width × `100px` height *(recommended)*
-- 🎶 **Standard**: `100%` width × `120px` height
+| Category | Formats | Presets (`Width × Height`) |
+| :--- | :--- | :--- |
+| 🎬 **Video** | `MP4`, `WebM`, `MOV`, `AVI` | **Compact** (`60% × 280px`), **Medium** (`80% × 400px` ★), **Large** (`100% × 500px`), **Full width** (`100% × 600px`) |
+| 📄 **Document** | `PDF` | **Compact** (`70% × 400px`), **Medium** (`100% × 500px` ★), **Large** (`100% × 650px`), **Full screen** (`100% × 800px`) |
+| 🎵 **Audio** | `MP3`, `WAV`, `OGG`, `M4A` | **Slim** (`100% × 100px` ★), **Standard** (`100% × 120px`) |
+| 🖼️ **Image** | `JPG`, `JPEG`, `PNG`, `GIF`, `WebP`, `SVG` | **Thumbnail** (`200px`), **Compact** (`400px`), **Medium** (`600px` ★), **Large** (`100%`) |
 
-#### Images
-- 🔹 **Thumbnail**: `200px` width
-- 🔸 **Compact**: `400px` width
-- 🔶 **Medium**: `600px` width *(recommended)*
-- 🟠 **Large**: `100%` width
+*(★ = default recommended preset)*
 
-## Settings
+---
 
-- **Google OAuth**: Client ID and Client secret
-- **Upload folder**: Upload destination path on Google Drive (default: `Obsidian/DriveEmbedder`)
-- **Show filename by default**: Bold the clickable filename link above the embed by default
-- **Default theme**: Auto-detect system theme (`auto`) or force `light` / `dark`
-- **Default embed size**: Configure default size presets for Video, Audio, Document, and Image
+## Settings Overview
 
-## Supported File Types
+- **Connection status**: Connect, Reconnect (to refresh expired sessions or grant updated scopes), or Disconnect.
+- **Google OAuth**: OAuth `Client ID` and `Client secret`.
+- **Upload folder**: Target folder path on Google Drive (default: `Obsidian/DriveEmbedder`). Also scopes the **All Drive files** tab in the sidebar manager.
+- **Show filename by default**: Bold the clickable `[📁 filename](...)` link above generated embeds by default.
+- **Google smart chips on paste**: Toggle automatic conversion of pasted Google Drive/Docs URLs into named Smart Chips.
+- **Default theme & Default embed size**: Configure appearance and default size preferences.
 
-| Category | Formats |
-|----------|---------|
-| 🎬 Video | MP4, WebM, MOV, AVI |
-| 🎵 Audio | MP3, WAV, OGG, M4A |
-| 📄 Document | PDF |
-| 🖼️ Image | JPG, JPEG, PNG, GIF, WebP, SVG |
+---
 
 ## Security & Privacy
 
-- Your files are uploaded to **your own Google Drive** and remain **strictly private** (no public `anyone` permissions are set)
-- Private embeds are hydrated locally in Obsidian via authenticated Drive API downloads (`alt=media`) into temporary in-memory `blob:` URLs
-- OAuth tokens are stored locally in your vault's plugin configuration (`data.json`, ignored by Git) and refreshed automatically
-- No third-party servers are involved
+- **Zero Third-Party Servers**: Communicates exclusively with official Google OAuth2 / Google Drive v3 endpoints (`accounts.google.com`, `oauth2.googleapis.com`, `www.googleapis.com/drive/v3`, `www.googleapis.com/upload/drive/v3`, and `docs.google.com`/`drive.google.com` for link metadata) plus a temporary `127.0.0.1:8586` loopback listener for max 120 seconds during desktop OAuth login.
+- **Private by Design**: Uploaded files are never shared publicly; media is hydrated in-memory via authenticated `Bearer` requests into session-local `blob:` URLs (revoked automatically on plugin unload or disconnect) and rendered safely (`isEvalSupported: false` in PDF.js).
+- **Git Protection**: `data.json` is excluded via `.gitignore` so OAuth credentials and tokens are not committed to Git. See [roadmap.md](roadmap.md) for the security audit and planned Obsidian Keychain (`SecretStorage`) integration.
+
+---
 
 ## Troubleshooting
 
-### "not connected"
-- Verify Client ID and Client secret are correct
-- Ensure Google Drive API is enabled in your Google Cloud project
-- Check that the OAuth consent screen is configured and your Google account is added as a test user (if the app is in Testing mode)
+- **"Google Drive session expired" / Refresh Token Expired after 7 Days**:
+  - Click **`🔑 Reconnect & upload`** in the Upload Modal (or **Reconnect** in Settings). To stop tokens from expiring every 7 days, change your Google Cloud OAuth Consent Screen publishing status from *Testing* to **In production**.
+- **Private Google Docs Titles Show Default Labels (`Google Doc`, `Google Sheet`) on Paste**:
+  - Click **Reconnect** once in **Settings → Drive Embedder** so your OAuth token includes the `drive.metadata.readonly` scope.
+- **Port `8586` Already in Use**:
+  - Reload Obsidian (`Ctrl+R` / `Cmd+R`) and click **Connect** / **Reconnect** again.
 
-### Port 8586 Already in Use
-- Reload Obsidian (`Cmd+R` / `Ctrl+R`) and click **Connect** again
-
-### Upload Fails
-- Check your internet connection
-- Verify Google Drive has sufficient storage
-- Try disconnecting and reconnecting in the plugin settings
-
-### Token Expired
-- The plugin automatically refreshes expired access tokens using your refresh token
-- If issues persist, click **Disconnect** and **Connect** again
-
-## Version History
-
-### v1.0.14+ (Fork Enhancements – 2026-10)
-- **🔒 Private Google Drive Uploads**: Removed public `anyone` permission sharing; uploaded files stay strictly private
-- **🖼️ Authenticated Embed Hydration**: Automatically downloads private Drive media via authenticated API calls and renders images, `<video>`, `<audio>`, and PDFs using cached local Blob URLs in Reading View and Live Preview
-- **🔗 Always Insert Clickable Link**: Always includes a clickable `[📁 filename](...)` link above the embed and supports direct insertion into the active editor from the ribbon icon
-- **📱 Android / Mobile Support**: Enabled mobile compatibility (`isDesktopOnly: false`), lazy-loaded desktop-only Node/Electron modules, and added MIME wildcards for the Android file picker
-- **🛠️ OAuth Callback Hardening**: Improved localhost callback server lifecycle, port binding (`127.0.0.1:8586`), and connection cleanup
-
-### v1.0.8 – v1.0.14
-- Resolved ObsidianReviewBot validation and sentence-case requirements for community plugin compliance
-
-### v1.0.7 (2025-12-03)
-- **🌍 Complete Internationalization**: All user-facing text converted to English for worldwide distribution
-- **📝 Updated Interface**: Settings, modals, notices, and help documentation in English
-- **🌐 Global Ready**: Prepared for official Obsidian community plugin registry
-
-### v1.0.6 (2025-12-03)
-- **Audio Player Fix**: Increased audio embed height for proper Google Drive player display (`100px` / `120px`)
-
-### v1.0.5 (2025-12-03)
-- **Major Fix**: Switched to iframe-based embed for video/audio using `/preview` URL
-
-### v1.0.4 (2025-12-03)
-- **Critical Fix**: Corrected Google Drive URL parameter order
-
-### v1.0.3 (2025-12-03)
-- **Fixed**: Improved media embed playback
-
-### v1.0.0 (2025-01-25)
-- Initial release
+---
 
 ## Development
 
 ```bash
-# Clone repository
-git clone https://github.com/MarkusLitz/obsidian-embedder.git
-
 # Install dependencies
-npm install
+npm ci
 
-# Build plugin
+# Typecheck and build production bundle (main.js)
 npm run build
 
-# Development mode
+# Watch mode for development
 npm run dev
 ```
 
-## Credits
+See [CHANGELOG.md](CHANGELOG.md) for detailed release notes across `v2.0.0` and earlier versions.
 
-Originally developed by [reallygood83](https://github.com/reallygood83), enhanced by [MarkusLitz](https://github.com/MarkusLitz).
+---
 
-## License
+## Credits & License
 
-MIT License - see the [LICENSE](LICENSE) file for details.
+Originally created by [reallygood83](https://github.com/reallygood83), forked and expanded by [Markus Litz](https://github.com/MarkusLitz/obsidian-embedder).
 
+Released under the [MIT License](LICENSE).
