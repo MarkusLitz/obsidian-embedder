@@ -1,7 +1,7 @@
 {
-    "name": "drive-embedder",
-    "version": "1.0.14",
-    "description": "Upload local files to Google Drive and embed them in Obsidian notes",
+    "name": "mlitz-drive-embedder",
+    "version": "2.0.0",
+    "description": "Upload private files to Google Drive, render authenticated media & PDF.js embeds, and use Google Smart Chips in Obsidian",
     "main": "main.js",
     "scripts": {
         "dev": "node esbuild.config.mjs",
@@ -14,11 +14,12 @@
         "google-drive",
         "embedder",
         "file-upload",
+        "smart-chips",
         "audio",
         "video",
         "pdf"
     ],
-    "author": "reallygood83",
+    "author": "Markus Litz",
     "license": "MIT",
     "devDependencies": {
         "@types/node": "^16.11.6",

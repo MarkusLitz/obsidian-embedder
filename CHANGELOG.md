@@ -4,7 +4,11 @@ All notable changes to **Drive Embedder** are documented in this file.
 
 ---
 
-## [Unreleased] — 2026-10-21
+## [2.0.0] — 2026-11-13
+
+### Changed
+- **Standalone Fork Identity (`manifest.json`, `package.json`, `versions.json`)**:
+  - Updated plugin ID to `mlitz-drive-embedder`, bumped version to `2.0.0`, and set author metadata to `Markus Litz` (`https://github.com/MarkusLitz/obsidian-embedder`) to decouple the fork from Obsidian's upstream community plugin updater.
 
 ### Added
 - **Multi-File Upload & Batch Embedding (`src/upload-modal.ts`, `main.ts`, `styles.css`)**:

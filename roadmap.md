@@ -1,8 +1,8 @@
 # Drive Embedder — Security Audit, Data Leak Analysis & Roadmap
 
-**Date:** 2026-10-21  
-**Plugin Version:** `1.0.14` (Custom Fork / Patched Build)  
-**Target Directory:** `.obsidian/plugins/drive-embedder`
+**Date:** 2026-11-13  
+**Plugin Version:** `2.0.0` (`mlitz-drive-embedder`)  
+**Target Directory:** `.obsidian/plugins/mlitz-drive-embedder`
 
 ---
 
